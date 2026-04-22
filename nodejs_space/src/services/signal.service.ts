@@ -84,7 +84,7 @@ export class SignalService {
         indicators,
         config.rsi_overbought,
         config.rsi_oversold,
-        config.required_convergence,
+        2, // <-- umbral fijo cambiado a 2 (antes: config.required_convergence)
         volumeRatio,
       );
 
