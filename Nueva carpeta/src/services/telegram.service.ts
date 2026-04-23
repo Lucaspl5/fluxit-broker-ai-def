@@ -1,5 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import TelegramBot from 'node-telegram-bot-api';
+import TelegramBot = require('node-telegram-bot-api');
 import { PrismaService } from '../prisma/prisma.service';
 
 interface TelegramSignalMessage {
