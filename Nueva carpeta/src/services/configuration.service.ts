@@ -31,7 +31,7 @@ export class ConfigurationService {
           ma50_period: 50,
           ma200_period: 200,
           volume_threshold_pct: 120,
-          required_convergence: 3,
+          required_convergence: 2,
         },
       });
 
