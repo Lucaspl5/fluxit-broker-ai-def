@@ -1,8 +1,17 @@
 import { NestFactory } from '@nestjs/core';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { AppModule } from './app.module';
+import { execSync } from 'child_process';
 
 async function bootstrap() {
+  // Run database migrations on startup
+  try {
+    execSync('npx prisma migrate deploy', { stdio: 'inherit' });
+    console.log('Database migrations applied');
+  } catch (e) {
+    console.error('Migration failed:', e.message);
+  }
+
   const app = await NestFactory.create(AppModule);
 
   app.enableCors({ origin: '*', methods: 'GET,HEAD,PUT,PATCH,POST,DELETE' });
