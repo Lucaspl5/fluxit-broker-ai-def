@@ -48,13 +48,22 @@ export class AlpacaService {
 
       const bars: MarketBar[] = [];
       for await (const bar of iterator) {
+        const close = bar.ClosePrice ?? bar.c ?? bar.close;
+        const open  = bar.OpenPrice  ?? bar.o ?? bar.open;
+        const high  = bar.HighPrice  ?? bar.h ?? bar.high;
+        const low   = bar.LowPrice   ?? bar.l ?? bar.low;
+        const vol   = bar.Volume     ?? bar.v ?? bar.volume ?? 0;
+        const ts    = bar.Timestamp  ?? bar.t ?? bar.timestamp;
+
+        if (close == null) continue;
+
         bars.push({
-          timestamp: new Date(bar.Timestamp).getTime(),
-          open: bar.o,
-          high: bar.h,
-          low: bar.l,
-          close: bar.c,
-          volume: bar.v,
+          timestamp: new Date(ts).getTime(),
+          open: open ?? close,
+          high: high ?? close,
+          low:  low  ?? close,
+          close,
+          volume: vol,
         });
         if (bars.length >= limit) break;
       }
