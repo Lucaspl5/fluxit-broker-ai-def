@@ -6,7 +6,7 @@ import { execSync } from 'child_process';
 async function bootstrap() {
   // Run database migrations on startup
   try {
-    execSync('npx prisma migrate deploy', { stdio: 'inherit' });
+    execSync('npx prisma db push --accept-data-loss', { stdio: 'inherit' });
     console.log('Database migrations applied');
   } catch (e) {
     console.error('Migration failed:', e.message);
