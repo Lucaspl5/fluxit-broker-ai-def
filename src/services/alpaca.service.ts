@@ -1,5 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import Alpaca from '@alpacahq/alpaca-trade-api';
+import Alpaca = require('@alpacahq/alpaca-trade-api');
 
 export interface MarketBar {
   timestamp: number;
