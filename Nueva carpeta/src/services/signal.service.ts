@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { Cron } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
 import { AlpacaService } from './alpaca.service';
 import { TechnicalAnalysisService } from './technical-analysis.service';
@@ -18,6 +19,12 @@ export class SignalService {
     private telegram: TelegramService,
     private configuration: ConfigurationService,
   ) {}
+
+  @Cron('*/15 * * * *')
+  async scheduledAnalysis(): Promise<void> {
+    this.logger.log('Scheduled analysis triggered');
+    await this.executeAnalysis();
+  }
 
   /**
    * Execute full analysis for all enabled symbols

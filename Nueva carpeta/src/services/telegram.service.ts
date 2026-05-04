@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import TelegramBot = require('node-telegram-bot-api');
 import { PrismaService } from '../prisma/prisma.service';
 
@@ -15,13 +15,28 @@ interface TelegramSignalMessage {
 }
 
 @Injectable()
-export class TelegramService {
+export class TelegramService implements OnModuleInit {
   private readonly logger = new Logger(TelegramService.name);
   private bot: TelegramBot | null = null;
   private chatId: string | null = null;
 
   constructor(private prisma: PrismaService) {
     this.initializeBot();
+  }
+
+  async onModuleInit(): Promise<void> {
+    const domain = process.env.RAILWAY_PUBLIC_DOMAIN || process.env.APP_URL;
+    if (!domain || !this.bot) {
+      if (!domain) {
+        this.logger.warn('RAILWAY_PUBLIC_DOMAIN / APP_URL not set — Telegram webhook not registered. Button callbacks will not work.');
+      }
+      return;
+    }
+    const webhookUrl = `https://${domain}/webhook/telegram`;
+    const ok = await this.registerWebhook(webhookUrl);
+    if (ok) {
+      this.logger.log(`Telegram webhook registered: ${webhookUrl}`);
+    }
   }
 
   private initializeBot() {
@@ -114,8 +129,12 @@ export class TelegramService {
    */
   async sendSignalNotification(message: TelegramSignalMessage): Promise<number | null> {
     try {
-      if (!this.bot || !this.chatId) {
-        this.logger.warn('Telegram bot or chat ID not configured');
+      if (!this.bot) {
+        this.logger.error('Telegram bot not initialized — check TELEGRAM_BOT_TOKEN env var');
+        return null;
+      }
+      if (!this.chatId) {
+        this.logger.error('Telegram chat ID not set — check TELEGRAM_CHAT_ID env var');
         return null;
       }
 
