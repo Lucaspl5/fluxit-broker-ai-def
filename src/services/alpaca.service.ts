@@ -1,5 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
-import Alpaca = require('@alpacahq/alpaca-trade-api');
+
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const AlpacaAPI = require('@alpacahq/alpaca-trade-api');
 
 export interface MarketBar {
   timestamp: number;
@@ -24,7 +26,7 @@ export class AlpacaService {
       return;
     }
 
-    this.alpaca = new Alpaca({
+    this.alpaca = new AlpacaAPI({
       keyId: apiKey,
       secretKey,
       paper: true,
