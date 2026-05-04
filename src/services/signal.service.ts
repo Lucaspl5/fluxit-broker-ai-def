@@ -27,6 +27,12 @@ export class SignalService {
     this.logger.log(`Scheduled analysis finished — ${signals.length} signal(s) generated`);
   }
 
+  @Cron('0 18 * * 5')
+  async weeklyReport(): Promise<void> {
+    this.logger.log('Sending weekly report to Telegram');
+    await this.telegram.sendWeeklySummary();
+  }
+
   async executeAnalysis(): Promise<SignalModel[]> {
     const configs = await this.config.getEnabledConfigurations();
     const results: SignalModel[] = [];

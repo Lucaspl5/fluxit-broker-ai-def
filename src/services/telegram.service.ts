@@ -451,6 +451,68 @@ export class TelegramService implements OnModuleInit {
     }
   }
 
+  async sendWeeklySummary(): Promise<void> {
+    if (!this.bot || !this.chatId) return;
+
+    try {
+      const now = new Date();
+      const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+      const [signals, orders, perfs] = await Promise.all([
+        this.prisma.signal.findMany({ where: { timestamp: { gte: weekAgo } } }),
+        this.prisma.order.findMany({ where: { timestamp: { gte: weekAgo } } }),
+        this.prisma.performance.findMany({
+          where: { status: 'CLOSED', updated_at: { gte: weekAgo } },
+        }),
+      ]);
+
+      const buySignals  = signals.filter(s => s.signal_type === 'BUY').length;
+      const sellSignals = signals.filter(s => s.signal_type === 'SELL').length;
+      const executed    = orders.filter(o => o.status === 'EXECUTED').length;
+      const cancelled   = orders.filter(o => o.status === 'CANCELLED').length;
+
+      const totalPL  = perfs.reduce((acc, p) => acc + Number(p.profit_loss ?? 0), 0);
+      const wins     = perfs.filter(p => Number(p.profit_loss ?? 0) > 0);
+      const losses   = perfs.filter(p => Number(p.profit_loss ?? 0) <= 0);
+      const winRate  = perfs.length > 0 ? Math.round((wins.length / perfs.length) * 100) : 0;
+
+      const best  = perfs.sort((a, b) => Number(b.profit_loss ?? 0) - Number(a.profit_loss ?? 0))[0];
+      const worst = perfs.sort((a, b) => Number(a.profit_loss ?? 0) - Number(b.profit_loss ?? 0))[0];
+
+      const weekLabel = `${weekAgo.getDate()}/${weekAgo.getMonth() + 1} – ${now.getDate()}/${now.getMonth() + 1}`;
+      const plEmoji   = totalPL >= 0 ? '✅' : '❌';
+
+      let text =
+        `📊 <b>RESUMEN SEMANAL</b>\n` +
+        `📅 ${weekLabel}\n\n` +
+        `<b>Señales generadas:</b>\n` +
+        `  🟢 BUY: ${buySignals}  🔴 SELL: ${sellSignals}  (Total: ${signals.length})\n\n` +
+        `<b>Órdenes:</b>\n` +
+        `  ✅ Ejecutadas: ${executed}  🚫 Canceladas: ${cancelled}\n\n` +
+        `<b>Operaciones cerradas:</b> ${perfs.length}\n` +
+        `  🏆 Win rate: ${winRate}%  (${wins.length}W / ${losses.length}L)\n` +
+        `  ${plEmoji} P&L total: ${totalPL >= 0 ? '+' : ''}$${totalPL.toFixed(2)}\n`;
+
+      if (best) {
+        text += `\n🥇 Mejor trade: <b>${best.symbol}</b> +$${Number(best.profit_loss).toFixed(2)}`;
+      }
+      if (worst && worst.id !== best?.id) {
+        text += `\n📉 Peor trade: <b>${worst.symbol}</b> $${Number(worst.profit_loss).toFixed(2)}`;
+      }
+
+      if (perfs.length === 0 && executed === 0) {
+        text += `\n\n💤 Semana sin operaciones ejecutadas. El sistema sigue monitoreando.`;
+      }
+
+      text += `\n\n/menu para ver el dashboard completo`;
+
+      await this.bot.sendMessage(this.chatId, text, { parse_mode: 'HTML' });
+      this.logger.log('Weekly summary sent to Telegram');
+    } catch (error) {
+      this.logger.error(`sendWeeklySummary: ${error.message}`);
+    }
+  }
+
   async processUpdate(update: any): Promise<void> {
     if (!this.bot) return;
     try {
