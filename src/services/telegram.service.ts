@@ -151,15 +151,23 @@ export class TelegramService implements OnModuleInit {
     return text;
   }
 
-  private async buildPositionsText(): Promise<string> {
+  private async buildPositionsView(): Promise<{ text: string; keyboard: TelegramBot.InlineKeyboardMarkup }> {
     const positions = await this.prisma.performance.findMany({
       where: { status: 'OPEN' },
       include: { buy_order: true },
       orderBy: { entry_time: 'desc' },
     });
-    if (positions.length === 0) return '📌 <b>Posiciones Abiertas</b>\n\nNo hay posiciones abiertas.';
+
+    if (positions.length === 0) {
+      return {
+        text: '📌 <b>Posiciones Abiertas</b>\n\nNo hay posiciones abiertas.',
+        keyboard: this.backKeyboard(),
+      };
+    }
 
     let text = '📌 <b>Posiciones Abiertas</b>\n\n';
+    const closeButtons: TelegramBot.InlineKeyboardButton[][] = [];
+
     for (const p of positions) {
       const entry = new Date(p.entry_time).toLocaleString('es-ES', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
       text += `🟢 <b>${p.symbol}</b>\n`;
@@ -167,8 +175,11 @@ export class TelegramService implements OnModuleInit {
       text += `   Cantidad: ${Number(p.quantity).toFixed(2)} acc\n`;
       text += `   SL: $${Number(p.buy_order.stop_loss_price ?? 0).toFixed(2)}  TP: $${Number(p.buy_order.take_profit_price ?? 0).toFixed(2)}\n`;
       text += `   Desde: ${entry}\n\n`;
+      closeButtons.push([{ text: `🔴 Cerrar ${p.symbol}`, callback_data: `close_pos_${p.id}` }]);
     }
-    return text;
+
+    closeButtons.push([{ text: '← Volver al menú', callback_data: 'dash_menu' }]);
+    return { text, keyboard: { inline_keyboard: closeButtons } };
   }
 
   private async buildAccountText(): Promise<string> {
@@ -252,12 +263,25 @@ export class TelegramService implements OnModuleInit {
         return;
       }
 
+      if (data.startsWith('close_pos_')) {
+        await this.handleClosePosition(data, chat, msgId);
+        return;
+      }
+
+      if (data === 'dash_positions') {
+        const { text, keyboard } = await this.buildPositionsView();
+        await this.bot.editMessageText(text, {
+          chat_id: chat, message_id: msgId,
+          parse_mode: 'HTML', reply_markup: keyboard,
+        });
+        return;
+      }
+
       let sectionText = '';
       switch (data) {
         case 'dash_signals':     sectionText = await this.buildSignalsText();     break;
         case 'dash_orders':      sectionText = await this.buildOrdersText();      break;
         case 'dash_performance': sectionText = await this.buildPerformanceText(); break;
-        case 'dash_positions':   sectionText = await this.buildPositionsText();   break;
         case 'dash_account':     sectionText = await this.buildAccountText();     break;
         case 'dash_status':      sectionText = this.buildStatusText();            break;
         default: return;
@@ -268,6 +292,87 @@ export class TelegramService implements OnModuleInit {
         parse_mode: 'HTML', reply_markup: this.backKeyboard(),
       });
     });
+  }
+
+  private async handleClosePosition(data: string, chat: string, msgId: number): Promise<void> {
+    if (!this.bot) return;
+    const perfId = data.replace('close_pos_', '');
+
+    const perf = await this.prisma.performance.findUnique({
+      where: { id: perfId },
+      include: { buy_order: true },
+    });
+
+    if (!perf || perf.status !== 'OPEN') {
+      await this.bot.editMessageText('⚠️ Esta posición ya fue cerrada.', {
+        chat_id: chat, message_id: msgId, reply_markup: this.backKeyboard(),
+      });
+      return;
+    }
+
+    await this.bot.editMessageText(
+      `⏳ <b>Cerrando ${perf.symbol}...</b>\nEnviando orden de venta a Alpaca.`,
+      { chat_id: chat, message_id: msgId, parse_mode: 'HTML' },
+    );
+
+    const alpacaOrder = await this.alpaca.executeOrder({
+      symbol: perf.symbol,
+      qty: Number(perf.quantity),
+      side: 'sell',
+      type: 'market',
+    });
+
+    if (!alpacaOrder) {
+      await this.bot.editMessageText(
+        `❌ <b>Error al cerrar ${perf.symbol}.</b>\nNo se pudo conectar con Alpaca.`,
+        { chat_id: chat, message_id: msgId, parse_mode: 'HTML', reply_markup: this.backKeyboard() },
+      );
+      return;
+    }
+
+    const exitPrice = Number(perf.buy_order.price);
+    const entry     = Number(perf.entry_price);
+    const qty       = Number(perf.quantity);
+    const pl        = (exitPrice - entry) * qty;
+    const plPct     = ((exitPrice - entry) / entry) * 100;
+    const exitTime  = new Date();
+    const duration  = Math.floor((exitTime.getTime() - new Date(perf.entry_time).getTime()) / 1000);
+
+    await this.prisma.performance.update({
+      where: { id: perfId },
+      data: {
+        exit_price: exitPrice,
+        exit_time: exitTime,
+        profit_loss: pl,
+        profit_loss_pct: plPct,
+        duration_seconds: duration,
+        status: 'CLOSED',
+      },
+    });
+
+    await this.prisma.order.create({
+      data: {
+        configuration_id: perf.configuration_id,
+        symbol: perf.symbol,
+        order_type: 'SELL',
+        quantity: perf.quantity,
+        price: exitPrice,
+        max_risk_eur: perf.buy_order.max_risk_eur,
+        status: 'EXECUTED',
+        alpaca_order_id: alpacaOrder.id,
+        execution_time: exitTime,
+        notes: 'Closed manually via Telegram dashboard',
+      },
+    });
+
+    const plEmoji = pl >= 0 ? '✅' : '❌';
+    const { text, keyboard } = await this.buildPositionsView();
+    await this.bot.editMessageText(
+      `${plEmoji} <b>${perf.symbol} cerrada</b>  P&L: ${pl >= 0 ? '+' : ''}$${pl.toFixed(2)} (${plPct >= 0 ? '+' : ''}${plPct.toFixed(2)}%)\n\n` + text,
+      { chat_id: chat, message_id: msgId, parse_mode: 'HTML', reply_markup: keyboard },
+    );
+
+    this.logger.log(`Position manually closed: ${perf.symbol} P&L=${pl >= 0 ? '+' : ''}$${pl.toFixed(2)}`);
   }
 
   private async handleOrderCallback(
