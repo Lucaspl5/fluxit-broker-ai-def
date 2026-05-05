@@ -328,6 +328,8 @@ export class TelegramService implements OnModuleInit {
         },
       });
 
+      const exitTime = new Date();
+
       if (pendingOrder.order_type === 'BUY') {
         await this.prisma.performance.create({
           data: {
@@ -336,15 +338,49 @@ export class TelegramService implements OnModuleInit {
             signal_id: pendingOrder.signal_id || undefined,
             symbol: pendingOrder.symbol,
             entry_price: pendingOrder.price,
-            entry_time: new Date(),
+            entry_time: exitTime,
             quantity: pendingOrder.quantity,
             status: 'OPEN',
           },
         });
+      } else if (pendingOrder.order_type === 'SELL') {
+        const openPerf = await this.prisma.performance.findFirst({
+          where: { symbol: pendingOrder.symbol, status: 'OPEN' },
+          orderBy: { entry_time: 'asc' },
+        });
+        if (openPerf) {
+          const exitPrice = Number(pendingOrder.price);
+          const entry     = Number(openPerf.entry_price);
+          const qty       = Number(openPerf.quantity);
+          const pl        = (exitPrice - entry) * qty;
+          const plPct     = ((exitPrice - entry) / entry) * 100;
+          const duration  = Math.floor((exitTime.getTime() - new Date(openPerf.entry_time).getTime()) / 1000);
+          await this.prisma.performance.update({
+            where: { id: openPerf.id },
+            data: {
+              exit_price: exitPrice,
+              exit_time: exitTime,
+              profit_loss: pl,
+              profit_loss_pct: plPct,
+              duration_seconds: duration,
+              status: 'CLOSED',
+            },
+          });
+        }
       }
 
+      const plLine = pendingOrder.order_type === 'SELL' ? await (async () => {
+        const closed = await this.prisma.performance.findFirst({
+          where: { symbol: pendingOrder.symbol, status: 'CLOSED' },
+          orderBy: { exit_time: 'desc' },
+        });
+        if (!closed?.profit_loss) return '';
+        const pl = Number(closed.profit_loss);
+        return `\n${pl >= 0 ? '✅' : '❌'} P&L: ${pl >= 0 ? '+' : ''}$${pl.toFixed(2)}`;
+      })() : '';
+
       await this.bot.editMessageText(
-        query.message.text + '\n\n✅ <b>Orden ejecutada en Alpaca.</b>',
+        query.message.text + `\n\n✅ <b>Orden ejecutada en Alpaca.</b>${plLine}`,
         { chat_id: chat, message_id: msgId, parse_mode: 'HTML', reply_markup: this.backKeyboard() },
       );
 

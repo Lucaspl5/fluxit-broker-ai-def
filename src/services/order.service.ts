@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnApplicationBootstrap } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { AlpacaService } from './alpaca.service';
 import { TelegramService } from './telegram.service';
@@ -7,7 +7,7 @@ import { order as OrderModel } from '@prisma/client';
 import Decimal from 'decimal.js';
 
 @Injectable()
-export class OrderService {
+export class OrderService implements OnApplicationBootstrap {
   private readonly logger = new Logger(OrderService.name);
 
   constructor(
@@ -16,6 +16,51 @@ export class OrderService {
     private telegram: TelegramService,
     private config: ConfigurationService,
   ) {}
+
+  async onApplicationBootstrap() {
+    await this.reconcileOpenPositions();
+  }
+
+  private async reconcileOpenPositions(): Promise<void> {
+    const openPositions = await this.prisma.performance.findMany({
+      where: { status: 'OPEN' },
+    });
+    if (openPositions.length === 0) return;
+
+    let closed = 0;
+    for (const pos of openPositions) {
+      const sellOrder = await this.prisma.order.findFirst({
+        where: { symbol: pos.symbol, order_type: 'SELL', status: 'EXECUTED', timestamp: { gte: pos.entry_time } },
+        orderBy: { timestamp: 'asc' },
+      });
+      if (!sellOrder) continue;
+
+      const exitPrice = Number(sellOrder.price);
+      const entry     = Number(pos.entry_price);
+      const qty       = Number(pos.quantity);
+      const pl        = (exitPrice - entry) * qty;
+      const plPct     = ((exitPrice - entry) / entry) * 100;
+      const exitTime  = sellOrder.execution_time || sellOrder.timestamp;
+      const duration  = Math.floor((exitTime.getTime() - new Date(pos.entry_time).getTime()) / 1000);
+
+      await this.prisma.performance.update({
+        where: { id: pos.id },
+        data: {
+          exit_price: new Decimal(exitPrice),
+          exit_time: exitTime,
+          profit_loss: new Decimal(pl),
+          profit_loss_pct: new Decimal(plPct),
+          duration_seconds: duration,
+          status: 'CLOSED',
+        },
+      });
+      closed++;
+    }
+
+    if (closed > 0) {
+      this.logger.log(`Reconciled ${closed} open position(s) with executed SELL orders`);
+    }
+  }
 
   async createPendingOrder(
     signalId: string,
@@ -100,9 +145,39 @@ export class OrderService {
           status: 'OPEN',
         },
       });
+    } else if (order.order_type === 'SELL') {
+      await this.closeOpenPosition(order.symbol, order.price.toNumber(), new Date());
     }
 
     return true;
+  }
+
+  async closeOpenPosition(symbol: string, exitPrice: number, exitTime: Date): Promise<void> {
+    const openPerf = await this.prisma.performance.findFirst({
+      where: { symbol, status: 'OPEN' },
+      orderBy: { entry_time: 'asc' },
+    });
+    if (!openPerf) return;
+
+    const entry    = Number(openPerf.entry_price);
+    const qty      = Number(openPerf.quantity);
+    const pl       = (exitPrice - entry) * qty;
+    const plPct    = ((exitPrice - entry) / entry) * 100;
+    const duration = Math.floor((exitTime.getTime() - new Date(openPerf.entry_time).getTime()) / 1000);
+
+    await this.prisma.performance.update({
+      where: { id: openPerf.id },
+      data: {
+        exit_price: new Decimal(exitPrice),
+        exit_time: exitTime,
+        profit_loss: new Decimal(pl),
+        profit_loss_pct: new Decimal(plPct),
+        duration_seconds: duration,
+        status: 'CLOSED',
+      },
+    });
+
+    this.logger.log(`Position closed: ${symbol} entry=$${entry} exit=$${exitPrice} P&L=${pl >= 0 ? '+' : ''}$${pl.toFixed(2)}`);
   }
 
   async cancelOrder(orderId: string): Promise<boolean> {
