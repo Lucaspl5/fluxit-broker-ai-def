@@ -33,6 +33,72 @@ export class SignalService {
     await this.telegram.sendWeeklySummary();
   }
 
+  @Cron('*/5 * * * *')
+  async checkStopLossTakeProfit(): Promise<void> {
+    const openPositions = await this.prisma.performance.findMany({
+      where: { status: 'OPEN' },
+      include: { buy_order: true },
+    });
+    if (openPositions.length === 0) return;
+
+    for (const pos of openPositions) {
+      const currentPrice = await this.alpaca.getLatestPrice(pos.symbol);
+      if (!currentPrice) continue;
+
+      const sl = Number(pos.buy_order.stop_loss_price ?? 0);
+      const tp = Number(pos.buy_order.take_profit_price ?? 0);
+
+      const hitSL = sl > 0 && currentPrice <= sl;
+      const hitTP = tp > 0 && currentPrice >= tp;
+
+      if (!hitSL && !hitTP) continue;
+
+      const reason = hitSL ? 'Stop Loss' : 'Take Profit';
+      this.logger.log(`${pos.symbol}: ${reason} triggered at $${currentPrice} (SL=$${sl} TP=$${tp})`);
+
+      const alpacaOrder = await this.alpaca.executeOrder({
+        symbol: pos.symbol, qty: Number(pos.quantity), side: 'sell', type: 'market',
+      });
+
+      const exitTime = new Date();
+      const entry    = Number(pos.entry_price);
+      const pl       = (currentPrice - entry) * Number(pos.quantity);
+      const plPct    = ((currentPrice - entry) / entry) * 100;
+      const duration = Math.floor((exitTime.getTime() - new Date(pos.entry_time).getTime()) / 1000);
+
+      await this.prisma.performance.update({
+        where: { id: pos.id },
+        data: {
+          exit_price: new Decimal(currentPrice),
+          exit_time: exitTime,
+          profit_loss: new Decimal(pl),
+          profit_loss_pct: new Decimal(plPct),
+          duration_seconds: duration,
+          status: 'CLOSED',
+        },
+      });
+
+      await this.prisma.order.create({
+        data: {
+          configuration_id: pos.configuration_id,
+          symbol: pos.symbol,
+          order_type: 'SELL',
+          quantity: pos.quantity,
+          price: new Decimal(currentPrice),
+          max_risk_eur: pos.buy_order.max_risk_eur,
+          status: alpacaOrder ? 'EXECUTED' : 'CANCELLED',
+          alpaca_order_id: alpacaOrder?.id,
+          execution_time: exitTime,
+          notes: `Auto-closed by ${reason}`,
+        },
+      });
+
+      const plEmoji = pl >= 0 ? '✅' : '❌';
+      await this.telegram.sendAutoClose(pos.symbol, reason, currentPrice, pl, plPct);
+      this.logger.log(`${pos.symbol} auto-closed (${reason}): P&L=${pl >= 0 ? '+' : ''}$${pl.toFixed(2)}`);
+    }
+  }
+
   async executeAnalysis(): Promise<SignalModel[]> {
     const configs = await this.config.getEnabledConfigurations();
     const results: SignalModel[] = [];

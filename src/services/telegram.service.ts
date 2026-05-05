@@ -381,16 +381,29 @@ export class TelegramService implements OnModuleInit {
 
     if (data.startsWith('order_')) {
       const parts = data.split('_');
+      const orderSide = parts[1] as 'buy' | 'sell';
       const signalId = parts.slice(2).join('_');
 
-      const pendingOrder = await this.prisma.order.findFirst({
-        where: { signal_id: signalId, status: 'PENDING' },
+      // Look up the signal to get order details
+      const signal = await this.prisma.signal.findUnique({
+        where: { id: signalId },
+        include: { configuration: true },
       });
 
-      if (!pendingOrder) {
-        await this.bot.editMessageText('⚠️ Esta orden ya fue procesada o no existe.', {
-          chat_id: chat, message_id: msgId,
-          reply_markup: this.backKeyboard(),
+      if (!signal) {
+        await this.bot.editMessageText('⚠️ Esta señal no existe.', {
+          chat_id: chat, message_id: msgId, reply_markup: this.backKeyboard(),
+        });
+        return;
+      }
+
+      // Check if already executed
+      const existingOrder = await this.prisma.order.findFirst({
+        where: { signal_id: signalId, status: { in: ['EXECUTED', 'AUTHORIZED'] } },
+      });
+      if (existingOrder) {
+        await this.bot.editMessageText('⚠️ Esta orden ya fue ejecutada anteriormente.', {
+          chat_id: chat, message_id: msgId, reply_markup: this.backKeyboard(),
         });
         return;
       }
@@ -401,91 +414,78 @@ export class TelegramService implements OnModuleInit {
       );
 
       const alpacaOrder = await this.alpaca.executeOrder({
-        symbol: pendingOrder.symbol,
-        qty: Number(pendingOrder.quantity),
-        side: pendingOrder.order_type.toLowerCase() as 'buy' | 'sell',
+        symbol: signal.symbol,
+        qty: 1,
+        side: orderSide,
         type: 'market',
       });
 
-      if (!alpacaOrder) {
-        await this.prisma.order.update({
-          where: { id: pendingOrder.id },
-          data: { status: 'FAILED', status_reason: 'Alpaca execution failed' },
-        });
-        await this.bot.editMessageText(
-          query.message.text + '\n\n❌ <b>Error al ejecutar en Alpaca.</b>',
-          { chat_id: chat, message_id: msgId, parse_mode: 'HTML', reply_markup: this.backKeyboard() },
-        );
-        return;
-      }
+      const cfg = signal.configuration;
+      const price = Number(signal.current_price);
+      const slMul = orderSide === 'buy' ? 1 - Number(cfg.stop_loss_pct) / 100 : 1 + Number(cfg.stop_loss_pct) / 100;
+      const tpMul = orderSide === 'buy' ? 1 + Number(cfg.take_profit_pct) / 100 : 1 - Number(cfg.take_profit_pct) / 100;
 
-      await this.prisma.order.update({
-        where: { id: pendingOrder.id },
+      const savedOrder = await this.prisma.order.create({
         data: {
-          status: 'EXECUTED',
-          alpaca_order_id: alpacaOrder.id,
+          configuration_id: cfg.id,
+          signal_id: signalId,
+          symbol: signal.symbol,
+          order_type: orderSide.toUpperCase() as 'BUY' | 'SELL',
+          quantity: 1,
+          price,
+          stop_loss_price: price * slMul,
+          take_profit_price: price * tpMul,
+          max_risk_eur: cfg.max_risk_per_trade,
+          risk_level: cfg.risk_profile === 'BAJO' ? 'LOW' : cfg.risk_profile === 'MEDIUM' ? 'MEDIUM' : 'HIGH',
+          status: alpacaOrder ? 'EXECUTED' : 'CANCELLED',
+          alpaca_order_id: alpacaOrder?.id,
           user_authorization_time: new Date(),
           execution_time: new Date(),
+          status_reason: alpacaOrder ? undefined : 'Market closed — will execute at open',
         },
       });
 
       const exitTime = new Date();
 
-      if (pendingOrder.order_type === 'BUY') {
+      if (orderSide === 'buy') {
         await this.prisma.performance.create({
           data: {
-            configuration_id: pendingOrder.configuration_id,
-            buy_order_id: pendingOrder.id,
-            signal_id: pendingOrder.signal_id || undefined,
-            symbol: pendingOrder.symbol,
-            entry_price: pendingOrder.price,
+            configuration_id: cfg.id,
+            buy_order_id: savedOrder.id,
+            signal_id: signalId,
+            symbol: signal.symbol,
+            entry_price: price,
             entry_time: exitTime,
-            quantity: pendingOrder.quantity,
+            quantity: 1,
             status: 'OPEN',
           },
         });
-      } else if (pendingOrder.order_type === 'SELL') {
+      } else {
         const openPerf = await this.prisma.performance.findFirst({
-          where: { symbol: pendingOrder.symbol, status: 'OPEN' },
+          where: { symbol: signal.symbol, status: 'OPEN' },
           orderBy: { entry_time: 'asc' },
         });
         if (openPerf) {
-          const exitPrice = Number(pendingOrder.price);
-          const entry     = Number(openPerf.entry_price);
-          const qty       = Number(openPerf.quantity);
-          const pl        = (exitPrice - entry) * qty;
-          const plPct     = ((exitPrice - entry) / entry) * 100;
-          const duration  = Math.floor((exitTime.getTime() - new Date(openPerf.entry_time).getTime()) / 1000);
+          const entry   = Number(openPerf.entry_price);
+          const pl      = (price - entry) * 1;
+          const plPct   = ((price - entry) / entry) * 100;
+          const duration = Math.floor((exitTime.getTime() - new Date(openPerf.entry_time).getTime()) / 1000);
           await this.prisma.performance.update({
             where: { id: openPerf.id },
-            data: {
-              exit_price: exitPrice,
-              exit_time: exitTime,
-              profit_loss: pl,
-              profit_loss_pct: plPct,
-              duration_seconds: duration,
-              status: 'CLOSED',
-            },
+            data: { exit_price: price, exit_time: exitTime, profit_loss: pl, profit_loss_pct: plPct, duration_seconds: duration, status: 'CLOSED' },
           });
         }
       }
 
-      const plLine = pendingOrder.order_type === 'SELL' ? await (async () => {
-        const closed = await this.prisma.performance.findFirst({
-          where: { symbol: pendingOrder.symbol, status: 'CLOSED' },
-          orderBy: { exit_time: 'desc' },
-        });
-        if (!closed?.profit_loss) return '';
-        const pl = Number(closed.profit_loss);
-        return `\n${pl >= 0 ? '✅' : '❌'} P&L: ${pl >= 0 ? '+' : ''}$${pl.toFixed(2)}`;
-      })() : '';
+      const statusLine = alpacaOrder
+        ? '✅ <b>Orden ejecutada.</b>'
+        : '✅ <b>Orden registrada.</b>\n⚠️ <i>Mercado cerrado — se ejecutará en la apertura.</i>';
 
       await this.bot.editMessageText(
-        query.message.text + `\n\n✅ <b>Orden ejecutada en Alpaca.</b>${plLine}`,
+        query.message.text + `\n\n${statusLine}`,
         { chat_id: chat, message_id: msgId, parse_mode: 'HTML', reply_markup: this.backKeyboard() },
       );
-
-      this.logger.log(`Order executed via Telegram: signal=${signalId} order=${pendingOrder.id}`);
+      this.logger.log(`Order executed via Telegram: signal=${signalId} side=${orderSide} symbol=${signal.symbol}`);
 
     } else if (data.startsWith('cancel_')) {
       const signalId = data.replace('cancel_', '');
@@ -585,6 +585,22 @@ export class TelegramService implements OnModuleInit {
       await this.bot.answerCallbackQuery(callbackQueryId, { text, show_alert: showAlert });
     } catch (error) {
       this.logger.error(`answerCallbackQuery: ${error.message}`);
+    }
+  }
+
+  async sendAutoClose(symbol: string, reason: string, price: number, pl: number, plPct: number): Promise<void> {
+    if (!this.bot || !this.chatId) return;
+    try {
+      const plEmoji = pl >= 0 ? '✅' : '❌';
+      await this.bot.sendMessage(this.chatId,
+        `🤖 <b>Cierre automático — ${symbol}</b>\n\n` +
+        `📌 Motivo: <b>${reason}</b>\n` +
+        `💰 Precio de salida: $${price.toFixed(2)}\n` +
+        `${plEmoji} P&L: ${pl >= 0 ? '+' : ''}$${pl.toFixed(2)} (${plPct >= 0 ? '+' : ''}${plPct.toFixed(2)}%)`,
+        { parse_mode: 'HTML' },
+      );
+    } catch (error) {
+      this.logger.error(`sendAutoClose: ${error.message}`);
     }
   }
 
