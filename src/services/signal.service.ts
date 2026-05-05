@@ -57,6 +57,13 @@ export class SignalService {
       const sl   = Number(ref.buy_order.stop_loss_price ?? 0);
       const tp   = Number(ref.buy_order.take_profit_price ?? 0);
 
+      // Don't trigger SL/TP on positions younger than 2 hours (daily price data would instantly close them)
+      const ageMs = Date.now() - new Date(ref.entry_time).getTime();
+      if (ageMs < 2 * 60 * 60 * 1000) {
+        this.logger.log(`${symbol}: skipping SL/TP check — position is less than 2h old`);
+        continue;
+      }
+
       const hitSL = sl > 0 && currentPrice <= sl;
       const hitTP = tp > 0 && currentPrice >= tp;
 
@@ -171,17 +178,17 @@ export class SignalService {
           return null;
         }
 
-        // Skip BUY if a Stop Loss was triggered in the last 4 hours
-        const recentSL = await this.prisma.order.findFirst({
+        // Skip BUY if a Stop Loss or Take Profit was triggered in the last 6 hours
+        const recentClose = await this.prisma.order.findFirst({
           where: {
             symbol: symbol.toUpperCase(),
             order_type: 'SELL',
-            notes: { contains: 'Stop Loss' },
-            execution_time: { gte: new Date(Date.now() - 4 * 60 * 60 * 1000) },
+            notes: { contains: 'Auto-closed' },
+            execution_time: { gte: new Date(Date.now() - 6 * 60 * 60 * 1000) },
           },
         });
-        if (recentSL) {
-          this.logger.log(`${symbol}: skipping BUY — Stop Loss triggered less than 4h ago`);
+        if (recentClose) {
+          this.logger.log(`${symbol}: skipping BUY — auto-close triggered less than 6h ago`);
           return null;
         }
       }
