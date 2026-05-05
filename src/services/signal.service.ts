@@ -79,6 +79,17 @@ export class SignalService {
       );
       if (!convergence) return null;
 
+      // Skip BUY if there's already an open position for this symbol
+      if (convergence.type === 'BUY') {
+        const openPosition = await this.prisma.performance.findFirst({
+          where: { symbol: symbol.toUpperCase(), status: 'OPEN' },
+        });
+        if (openPosition) {
+          this.logger.log(`${symbol}: skipping BUY — already have an open position`);
+          return null;
+        }
+      }
+
       const saved = await this.prisma.signal.create({
         data: {
           configuration_id: cfg.id,

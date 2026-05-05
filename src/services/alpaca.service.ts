@@ -123,4 +123,15 @@ export class AlpacaService {
       return null;
     }
   }
+
+  async getLatestPrice(symbol: string): Promise<number | null> {
+    try {
+      const bars = await this.getHistoricalData(symbol, '1Day', 1);
+      if (bars.length === 0) return null;
+      return bars[bars.length - 1].close;
+    } catch (error) {
+      this.logger.error(`getLatestPrice(${symbol}): ${error.message}`);
+      return null;
+    }
+  }
 }

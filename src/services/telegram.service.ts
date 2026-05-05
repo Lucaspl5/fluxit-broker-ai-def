@@ -322,7 +322,8 @@ export class TelegramService implements OnModuleInit {
       type: 'market',
     });
 
-    const exitPrice = Number(perf.entry_price);
+    const latestPrice = await this.alpaca.getLatestPrice(perf.symbol);
+    const exitPrice = latestPrice ?? Number(perf.entry_price);
     const entry     = Number(perf.entry_price);
     const qty       = Number(perf.quantity);
     const pl        = (exitPrice - entry) * qty;
