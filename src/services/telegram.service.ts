@@ -397,15 +397,32 @@ export class TelegramService implements OnModuleInit {
         return;
       }
 
-      // Check if already executed
-      const existingOrder = await this.prisma.order.findFirst({
-        where: { signal_id: signalId, status: { in: ['EXECUTED', 'AUTHORIZED'] } },
-      });
-      if (existingOrder) {
-        await this.bot.editMessageText('⚠️ Esta orden ya fue ejecutada anteriormente.', {
-          chat_id: chat, message_id: msgId, reply_markup: this.backKeyboard(),
+      // Block BUY if already have open position for this symbol
+      if (orderSide === 'buy') {
+        const openPos = await this.prisma.performance.findFirst({
+          where: { symbol: signal.symbol, status: 'OPEN' },
         });
-        return;
+        if (openPos) {
+          await this.bot.editMessageText(
+            `⚠️ Ya tienes una posición abierta en <b>${signal.symbol}</b>. Ciérrala primero.`,
+            { chat_id: chat, message_id: msgId, parse_mode: 'HTML', reply_markup: this.backKeyboard() },
+          );
+          return;
+        }
+      }
+
+      // Block SELL if no open position for this symbol
+      if (orderSide === 'sell') {
+        const openPos = await this.prisma.performance.findFirst({
+          where: { symbol: signal.symbol, status: 'OPEN' },
+        });
+        if (!openPos) {
+          await this.bot.editMessageText(
+            `⚠️ No tienes posición abierta en <b>${signal.symbol}</b> para vender.`,
+            { chat_id: chat, message_id: msgId, parse_mode: 'HTML', reply_markup: this.backKeyboard() },
+          );
+          return;
+        }
       }
 
       await this.bot.editMessageText(
