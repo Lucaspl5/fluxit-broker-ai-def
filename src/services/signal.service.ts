@@ -170,6 +170,20 @@ export class SignalService {
           this.logger.log(`${symbol}: skipping BUY — already have an open position`);
           return null;
         }
+
+        // Skip BUY if a Stop Loss was triggered in the last 4 hours
+        const recentSL = await this.prisma.order.findFirst({
+          where: {
+            symbol: symbol.toUpperCase(),
+            order_type: 'SELL',
+            notes: { contains: 'Stop Loss' },
+            execution_time: { gte: new Date(Date.now() - 4 * 60 * 60 * 1000) },
+          },
+        });
+        if (recentSL) {
+          this.logger.log(`${symbol}: skipping BUY — Stop Loss triggered less than 4h ago`);
+          return null;
+        }
       }
 
       const saved = await this.prisma.signal.create({
