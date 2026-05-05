@@ -311,7 +311,7 @@ export class TelegramService implements OnModuleInit {
     }
 
     await this.bot.editMessageText(
-      `⏳ <b>Cerrando ${perf.symbol}...</b>\nEnviando orden de venta a Alpaca.`,
+      `⏳ <b>Cerrando ${perf.symbol}...</b>`,
       { chat_id: chat, message_id: msgId, parse_mode: 'HTML' },
     );
 
@@ -322,15 +322,7 @@ export class TelegramService implements OnModuleInit {
       type: 'market',
     });
 
-    if (!alpacaOrder) {
-      await this.bot.editMessageText(
-        `❌ <b>Error al cerrar ${perf.symbol}.</b>\nNo se pudo conectar con Alpaca.`,
-        { chat_id: chat, message_id: msgId, parse_mode: 'HTML', reply_markup: this.backKeyboard() },
-      );
-      return;
-    }
-
-    const exitPrice = Number(perf.buy_order.price);
+    const exitPrice = Number(perf.entry_price);
     const entry     = Number(perf.entry_price);
     const qty       = Number(perf.quantity);
     const pl        = (exitPrice - entry) * qty;
@@ -358,17 +350,20 @@ export class TelegramService implements OnModuleInit {
         quantity: perf.quantity,
         price: exitPrice,
         max_risk_eur: perf.buy_order.max_risk_eur,
-        status: 'EXECUTED',
-        alpaca_order_id: alpacaOrder.id,
+        status: alpacaOrder ? 'EXECUTED' : 'CANCELLED',
+        alpaca_order_id: alpacaOrder?.id,
         execution_time: exitTime,
-        notes: 'Closed manually via Telegram dashboard',
+        notes: alpacaOrder
+          ? 'Closed manually via Telegram dashboard'
+          : 'Closed manually (market closed — Alpaca order pending)',
       },
     });
 
     const plEmoji = pl >= 0 ? '✅' : '❌';
+    const alpacaNote = alpacaOrder ? '' : '\n⚠️ <i>Mercado cerrado: posición cerrada en el sistema. La orden en Alpaca se ejecutará en la apertura.</i>';
     const { text, keyboard } = await this.buildPositionsView();
     await this.bot.editMessageText(
-      `${plEmoji} <b>${perf.symbol} cerrada</b>  P&L: ${pl >= 0 ? '+' : ''}$${pl.toFixed(2)} (${plPct >= 0 ? '+' : ''}${plPct.toFixed(2)}%)\n\n` + text,
+      `${plEmoji} <b>${perf.symbol} cerrada</b>  P&L: ${pl >= 0 ? '+' : ''}$${pl.toFixed(2)} (${plPct >= 0 ? '+' : ''}${plPct.toFixed(2)}%)${alpacaNote}\n\n` + text,
       { chat_id: chat, message_id: msgId, parse_mode: 'HTML', reply_markup: keyboard },
     );
 
