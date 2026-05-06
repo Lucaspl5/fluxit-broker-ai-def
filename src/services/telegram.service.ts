@@ -544,9 +544,26 @@ export class TelegramService implements OnModuleInit {
     const url = `https://${domain}/webhook/telegram`;
     try {
       await this.bot.setWebHook(url);
-      this.logger.log(`Webhook registered: ${url}`);
+      const info = await this.bot.getWebHookInfo();
+      this.logger.log(`Webhook registered: ${url} | pending_updates: ${info.pending_update_count} | last_error: ${info.last_error_message || 'none'}`);
     } catch (error) {
       this.logger.error(`Failed to register webhook: ${error.message}`);
+    }
+  }
+
+  async forceRegisterWebhook(): Promise<object> {
+    if (!this.bot) return { error: 'Bot not initialized' };
+
+    const domain = process.env.RAILWAY_PUBLIC_DOMAIN || process.env.APP_URL;
+    if (!domain) return { error: 'RAILWAY_PUBLIC_DOMAIN not set' };
+
+    const url = `https://${domain}/webhook/telegram`;
+    try {
+      await this.bot.setWebHook(url);
+      const info = await this.bot.getWebHookInfo();
+      return { ok: true, url, info };
+    } catch (error) {
+      return { error: error.message };
     }
   }
 

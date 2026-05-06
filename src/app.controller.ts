@@ -1,7 +1,10 @@
 import { Controller, Get } from '@nestjs/common';
+import { TelegramService } from './services/telegram.service';
 
 @Controller()
 export class AppController {
+  constructor(private telegram: TelegramService) {}
+
   @Get()
   root() {
     return {
@@ -15,5 +18,11 @@ export class AppController {
   @Get('health')
   health() {
     return { status: 'ok', timestamp: new Date().toISOString() };
+  }
+
+  @Get('admin/register-webhook')
+  async registerWebhook() {
+    const result = await this.telegram.forceRegisterWebhook();
+    return result;
   }
 }
