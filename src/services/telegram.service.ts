@@ -259,49 +259,58 @@ export class TelegramService implements OnModuleInit {
       const msgId = query.message.message_id;
       const data  = query.data || '';
 
-      await this.bot.answerCallbackQuery(query.id);
+      try {
+        await this.bot.answerCallbackQuery(query.id);
+      } catch (_) {}
 
-      if (data === 'dash_menu') {
-        await this.bot.editMessageText(this.mainMenuText(), {
+      try {
+        if (data === 'dash_menu') {
+          await this.bot.editMessageText(this.mainMenuText(), {
+            chat_id: chat, message_id: msgId,
+            parse_mode: 'HTML', reply_markup: this.mainMenuKeyboard(),
+          });
+          return;
+        }
+
+        if (data.startsWith('order_') || data.startsWith('cancel_')) {
+          await this.handleOrderCallback(query, data, chat, msgId);
+          return;
+        }
+
+        if (data.startsWith('close_pos_')) {
+          await this.handleClosePosition(data, chat, msgId);
+          return;
+        }
+
+        if (data === 'dash_positions') {
+          const { text, keyboard } = await this.buildPositionsView();
+          await this.bot.editMessageText(text, {
+            chat_id: chat, message_id: msgId,
+            parse_mode: 'HTML', reply_markup: keyboard,
+          });
+          return;
+        }
+
+        let sectionText = '';
+        switch (data) {
+          case 'dash_signals':     sectionText = await this.buildSignalsText();     break;
+          case 'dash_orders':      sectionText = await this.buildOrdersText();      break;
+          case 'dash_performance': sectionText = await this.buildPerformanceText(); break;
+          case 'dash_account':     sectionText = await this.buildAccountText();     break;
+          case 'dash_status':      sectionText = this.buildStatusText();            break;
+          default: return;
+        }
+
+        await this.bot.editMessageText(sectionText, {
           chat_id: chat, message_id: msgId,
-          parse_mode: 'HTML', reply_markup: this.mainMenuKeyboard(),
+          parse_mode: 'HTML', reply_markup: this.backKeyboard(),
         });
-        return;
+      } catch (e) {
+        this.logger.error(`callback_query [${data}] error: ${e.message}`);
+        try {
+          await this.bot!.sendMessage(chat, `❌ Error procesando la acción. Intenta de nuevo.`);
+        } catch (_) {}
       }
-
-      if (data.startsWith('order_') || data.startsWith('cancel_')) {
-        await this.handleOrderCallback(query, data, chat, msgId);
-        return;
-      }
-
-      if (data.startsWith('close_pos_')) {
-        await this.handleClosePosition(data, chat, msgId);
-        return;
-      }
-
-      if (data === 'dash_positions') {
-        const { text, keyboard } = await this.buildPositionsView();
-        await this.bot.editMessageText(text, {
-          chat_id: chat, message_id: msgId,
-          parse_mode: 'HTML', reply_markup: keyboard,
-        });
-        return;
-      }
-
-      let sectionText = '';
-      switch (data) {
-        case 'dash_signals':     sectionText = await this.buildSignalsText();     break;
-        case 'dash_orders':      sectionText = await this.buildOrdersText();      break;
-        case 'dash_performance': sectionText = await this.buildPerformanceText(); break;
-        case 'dash_account':     sectionText = await this.buildAccountText();     break;
-        case 'dash_status':      sectionText = this.buildStatusText();            break;
-        default: return;
-      }
-
-      await this.bot.editMessageText(sectionText, {
-        chat_id: chat, message_id: msgId,
-        parse_mode: 'HTML', reply_markup: this.backKeyboard(),
-      });
     });
   }
 
