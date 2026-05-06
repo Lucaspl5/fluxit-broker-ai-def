@@ -220,7 +220,8 @@ export class TelegramService implements OnModuleInit {
     if (!this.bot) return;
 
     this.bot.on('message', async (msg) => {
-      const text = msg.text?.toLowerCase().trim() || '';
+      const raw  = msg.text?.toLowerCase().trim() || '';
+      const text = raw.replace(/@\S+/, '').trim(); // strip @botname suffix
       const chat = String(msg.chat.id);
 
       if (text === '/start' || text === '/menu') {
