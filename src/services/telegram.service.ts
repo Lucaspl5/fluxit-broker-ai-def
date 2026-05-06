@@ -219,17 +219,25 @@ export class TelegramService implements OnModuleInit {
   private registerHandlers() {
     if (!this.bot) return;
 
-    this.bot.on('message', async (msg) => {
-      const raw  = msg.text?.toLowerCase().trim() || '';
-      const text = raw.replace(/@\S+/, '').trim(); // strip @botname suffix
-      const chat = String(msg.chat.id);
-
-      if (text === '/start' || text === '/menu') {
-        await this.bot!.sendMessage(chat, this.mainMenuText(), {
+    const sendMenu = async (chatId: string) => {
+      try {
+        await this.bot!.sendMessage(chatId, this.mainMenuText(), {
           parse_mode: 'HTML',
           reply_markup: this.mainMenuKeyboard(),
         });
-      } else if (text === '/help') {
+      } catch (e) {
+        this.logger.error(`sendMenu error: ${e.message}`);
+      }
+    };
+
+    this.bot.onText(/^\/(start|menu)(@\S+)?$/i, async (msg) => {
+      this.logger.log(`Command received: ${msg.text} from chat ${msg.chat.id}`);
+      await sendMenu(String(msg.chat.id));
+    });
+
+    this.bot.onText(/^\/help(@\S+)?$/i, async (msg) => {
+      const chat = String(msg.chat.id);
+      try {
         await this.bot!.sendMessage(chat,
           '❓ <b>Ayuda — Broker AI</b>\n\n' +
           'Analiza 13 acciones cada 15 minutos con 4 indicadores:\n' +
@@ -240,6 +248,8 @@ export class TelegramService implements OnModuleInit {
           '/help — Esta ayuda',
           { parse_mode: 'HTML' },
         );
+      } catch (e) {
+        this.logger.error(`sendHelp error: ${e.message}`);
       }
     });
 
