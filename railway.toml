@@ -1,6 +1,7 @@
+[build]
+buildCommand = "npm install && npx prisma generate && npm run build && npx prisma db push --accept-data-loss && npx tsx prisma/seed.ts"
+
 [deploy]
 startCommand = "node dist/main"
-healthcheckPath = "/health"
-healthcheckTimeout = 120
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
