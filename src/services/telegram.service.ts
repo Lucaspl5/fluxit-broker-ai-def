@@ -398,13 +398,25 @@ export class TelegramService implements OnModuleInit {
       }
 
       // Block BUY if already have open position for this symbol
+      // Use upsert-style atomic check to prevent race condition on double-tap
       if (orderSide === 'buy') {
-        const openPos = await this.prisma.performance.findFirst({
+        const existing = await this.prisma.performance.findFirst({
           where: { symbol: signal.symbol, status: 'OPEN' },
         });
-        if (openPos) {
+        if (existing) {
           await this.bot.editMessageText(
             `⚠️ Ya tienes una posición abierta en <b>${signal.symbol}</b>. Ciérrala primero.`,
+            { chat_id: chat, message_id: msgId, parse_mode: 'HTML', reply_markup: this.backKeyboard() },
+          );
+          return;
+        }
+        // Also block if there's already an order for this exact signal
+        const sameSignalOrder = await this.prisma.order.findFirst({
+          where: { signal_id: signalId, order_type: 'BUY' },
+        });
+        if (sameSignalOrder) {
+          await this.bot.editMessageText(
+            `⚠️ Esta señal de <b>${signal.symbol}</b> ya fue procesada.`,
             { chat_id: chat, message_id: msgId, parse_mode: 'HTML', reply_markup: this.backKeyboard() },
           );
           return;
