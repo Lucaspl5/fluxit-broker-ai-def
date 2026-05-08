@@ -35,6 +35,13 @@ export class SignalService {
 
   @Cron('*/5 * * * *')
   async checkStopLossTakeProfit(): Promise<void> {
+    // Only check SL/TP when market is actually open — avoids false triggers with stale daily prices
+    const marketOpen = await this.alpaca.isMarketOpen();
+    if (!marketOpen) {
+      this.logger.log('SL/TP check skipped — market is closed');
+      return;
+    }
+
     const openPositions = await this.prisma.performance.findMany({
       where: { status: 'OPEN' },
       include: { buy_order: true },
@@ -57,10 +64,10 @@ export class SignalService {
       const sl   = Number(ref.buy_order.stop_loss_price ?? 0);
       const tp   = Number(ref.buy_order.take_profit_price ?? 0);
 
-      // Don't trigger SL/TP on positions younger than 2 hours (daily price data would instantly close them)
+      // Don't trigger SL/TP on positions younger than 4 hours
       const ageMs = Date.now() - new Date(ref.entry_time).getTime();
-      if (ageMs < 2 * 60 * 60 * 1000) {
-        this.logger.log(`${symbol}: skipping SL/TP check — position is less than 2h old`);
+      if (ageMs < 4 * 60 * 60 * 1000) {
+        this.logger.log(`${symbol}: skipping SL/TP check — position is less than 4h old`);
         continue;
       }
 
@@ -178,17 +185,17 @@ export class SignalService {
           return null;
         }
 
-        // Skip BUY if a Stop Loss or Take Profit was triggered in the last 6 hours
+        // Skip BUY if a Stop Loss or Take Profit was triggered in the last 24 hours
         const recentClose = await this.prisma.order.findFirst({
           where: {
             symbol: symbol.toUpperCase(),
             order_type: 'SELL',
             notes: { contains: 'Auto-closed' },
-            execution_time: { gte: new Date(Date.now() - 6 * 60 * 60 * 1000) },
+            execution_time: { gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
           },
         });
         if (recentClose) {
-          this.logger.log(`${symbol}: skipping BUY — auto-close triggered less than 6h ago`);
+          this.logger.log(`${symbol}: skipping BUY — auto-close triggered less than 24h ago`);
           return null;
         }
       }

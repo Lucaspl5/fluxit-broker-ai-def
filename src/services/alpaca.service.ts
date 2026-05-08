@@ -124,11 +124,31 @@ export class AlpacaService {
     }
   }
 
-  async getLatestPrice(symbol: string): Promise<number | null> {
+  async isMarketOpen(): Promise<boolean> {
+    if (!this.alpaca) return false;
     try {
-      const bars = await this.getHistoricalData(symbol, '1Day', 1);
-      if (bars.length === 0) return null;
-      return bars[bars.length - 1].close;
+      const clock = await this.alpaca.getClock();
+      return clock.is_open === true;
+    } catch (error) {
+      this.logger.error(`getClock: ${error.message}`);
+      // Fallback: check NYSE hours by UTC time (Mon-Fri 13:30-21:00 UTC)
+      const now = new Date();
+      const day = now.getUTCDay(); // 0=Sun, 6=Sat
+      if (day === 0 || day === 6) return false;
+      const h = now.getUTCHours() * 60 + now.getUTCMinutes();
+      return h >= 13 * 60 + 30 && h < 21 * 60;
+    }
+  }
+
+  async getLatestPrice(symbol: string): Promise<number | null> {
+    if (!this.alpaca) return null;
+    try {
+      // Use 1-minute bars for a near real-time price instead of stale daily close
+      const bars = await this.getHistoricalData(symbol, '1Min', 5);
+      if (bars.length > 0) return bars[bars.length - 1].close;
+      // Fallback to daily if no intraday data (market closed)
+      const daily = await this.getHistoricalData(symbol, '1Day', 1);
+      return daily.length > 0 ? daily[daily.length - 1].close : null;
     } catch (error) {
       this.logger.error(`getLatestPrice(${symbol}): ${error.message}`);
       return null;
