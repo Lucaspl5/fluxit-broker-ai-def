@@ -200,6 +200,17 @@ export class SignalService {
         }
       }
 
+      // Skip SELL if there's no open position — nothing to sell
+      if (convergence.type === 'SELL') {
+        const openPosition = await this.prisma.performance.findFirst({
+          where: { symbol: symbol.toUpperCase(), status: 'OPEN' },
+        });
+        if (!openPosition) {
+          this.logger.log(`${symbol}: skipping SELL — no open position`);
+          return null;
+        }
+      }
+
       const saved = await this.prisma.signal.create({
         data: {
           configuration_id: cfg.id,
