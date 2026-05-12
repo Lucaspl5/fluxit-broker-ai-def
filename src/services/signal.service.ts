@@ -11,6 +11,7 @@ import Decimal from 'decimal.js';
 @Injectable()
 export class SignalService {
   private readonly logger = new Logger(SignalService.name);
+  private slTpRunning = false;
 
   constructor(
     private prisma: PrismaService,
@@ -35,7 +36,19 @@ export class SignalService {
 
   @Cron('*/5 * * * *')
   async checkStopLossTakeProfit(): Promise<void> {
-    // Only check SL/TP when market is actually open — avoids false triggers with stale daily prices
+    if (this.slTpRunning) {
+      this.logger.warn('SL/TP check skipped — previous run still in progress');
+      return;
+    }
+    this.slTpRunning = true;
+    try {
+      await this.runStopLossTakeProfit();
+    } finally {
+      this.slTpRunning = false;
+    }
+  }
+
+  private async runStopLossTakeProfit(): Promise<void> {
     const marketOpen = await this.alpaca.isMarketOpen();
     if (!marketOpen) {
       this.logger.log('SL/TP check skipped — market is closed');
@@ -48,7 +61,6 @@ export class SignalService {
     });
     if (openPositions.length === 0) return;
 
-    // Group by symbol to avoid processing duplicates separately
     const bySymbol = new Map<string, typeof openPositions>();
     for (const pos of openPositions) {
       if (!bySymbol.has(pos.symbol)) bySymbol.set(pos.symbol, []);
@@ -59,12 +71,10 @@ export class SignalService {
       const currentPrice = await this.alpaca.getLatestPrice(symbol);
       if (!currentPrice) continue;
 
-      // Use the first position's SL/TP as reference
-      const ref  = positions[0];
-      const sl   = Number(ref.buy_order.stop_loss_price ?? 0);
-      const tp   = Number(ref.buy_order.take_profit_price ?? 0);
+      const ref = positions[0];
+      const sl  = Number(ref.buy_order.stop_loss_price ?? 0);
+      const tp  = Number(ref.buy_order.take_profit_price ?? 0);
 
-      // Don't trigger SL/TP on positions younger than 4 hours
       const ageMs = Date.now() - new Date(ref.entry_time).getTime();
       if (ageMs < 4 * 60 * 60 * 1000) {
         this.logger.log(`${symbol}: skipping SL/TP check — position is less than 4h old`);
@@ -75,6 +85,15 @@ export class SignalService {
       const hitTP = tp > 0 && currentPrice >= tp;
 
       if (!hitSL && !hitTP) continue;
+
+      // Re-fetch to confirm position is still OPEN (prevents duplicate closes)
+      const stillOpen = await this.prisma.performance.findFirst({
+        where: { id: ref.id, status: 'OPEN' },
+      });
+      if (!stillOpen) {
+        this.logger.warn(`${symbol}: position already closed, skipping`);
+        continue;
+      }
 
       const reason  = hitSL ? 'Stop Loss' : 'Take Profit';
       const exitTime = new Date();
@@ -103,7 +122,6 @@ export class SignalService {
         });
       }
 
-      // Single Alpaca order for all positions of this symbol
       const alpacaOrder = await this.alpaca.executeOrder({
         symbol, qty: positions.reduce((s, p) => s + Number(p.quantity), 0), side: 'sell', type: 'market',
       });
@@ -175,7 +193,6 @@ export class SignalService {
       );
       if (!convergence) return null;
 
-      // Skip BUY if there's already an open position for this symbol
       if (convergence.type === 'BUY') {
         const openPosition = await this.prisma.performance.findFirst({
           where: { symbol: symbol.toUpperCase(), status: 'OPEN' },
@@ -185,7 +202,6 @@ export class SignalService {
           return null;
         }
 
-        // Skip BUY if a Stop Loss or Take Profit was triggered in the last 24 hours
         const recentClose = await this.prisma.order.findFirst({
           where: {
             symbol: symbol.toUpperCase(),
@@ -200,7 +216,6 @@ export class SignalService {
         }
       }
 
-      // Skip SELL if there's no open position — nothing to sell
       if (convergence.type === 'SELL') {
         const openPosition = await this.prisma.performance.findFirst({
           where: { symbol: symbol.toUpperCase(), status: 'OPEN' },
