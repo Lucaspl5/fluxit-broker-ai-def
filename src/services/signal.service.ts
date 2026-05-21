@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnApplicationBootstrap } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
 import { AlpacaService } from './alpaca.service';
@@ -9,7 +9,7 @@ import { signal as SignalModel } from '@prisma/client';
 import Decimal from 'decimal.js';
 
 @Injectable()
-export class SignalService {
+export class SignalService implements OnApplicationBootstrap {
   private readonly logger = new Logger(SignalService.name);
   private slTpRunning = false;
 
@@ -20,6 +20,22 @@ export class SignalService {
     private telegram: TelegramService,
     private config: ConfigurationService,
   ) {}
+
+  async onApplicationBootstrap(): Promise<void> {
+    const cancelled = await this.prisma.order.updateMany({
+      where: { status: 'PENDING' },
+      data: { status: 'CANCELLED', status_reason: 'Stale order cleared on startup' },
+    });
+    if (cancelled.count > 0) {
+      this.logger.log(`Startup cleanup: cancelled ${cancelled.count} stale PENDING order(s)`);
+    }
+
+    await this.prisma.signal.updateMany({
+      where: { telegram_message_id: { not: null } },
+      data: { telegram_message_id: null },
+    });
+    this.logger.log('Startup cleanup: cleared stale Telegram message IDs from signals');
+  }
 
   @Cron('*/15 * * * *')
   async scheduledAnalysis(): Promise<void> {
@@ -226,6 +242,19 @@ export class SignalService {
         }
       }
 
+      // Calculate recommended quantity using Alpaca buying power
+      const account = await this.alpaca.getAccount();
+      const buyingPower = account ? Number(account.buying_power ?? 0) : 0;
+      const recommendedQty = this.calculateRecommendedQuantity(
+        convergence.convergentCount,
+        ind.rsi,
+        cfg.rsi_oversold,
+        convergence.type as 'BUY' | 'SELL',
+        buyingPower,
+        currentPrice,
+        cfg.risk_profile,
+      );
+
       const saved = await this.prisma.signal.create({
         data: {
           configuration_id: cfg.id,
@@ -247,10 +276,11 @@ export class SignalService {
           risk_level: cfg.risk_profile === 'BAJO' ? 'LOW' : cfg.risk_profile === 'MEDIUM' ? 'MEDIUM' : 'HIGH',
           recommendation: this.toRecommendation(convergence.type, convergence.convergentCount),
           reasoning: convergence.reasoning,
+          recommended_quantity: recommendedQty,
         },
       });
 
-      this.logger.log(`Signal saved: ${symbol} ${convergence.type} (${convergence.convergentCount} indicators)`);
+      this.logger.log(`Signal saved: ${symbol} ${convergence.type} (${convergence.convergentCount} indicators, qty=${recommendedQty})`);
 
       const messageId = await this.telegram.sendSignalNotification({
         symbol,
@@ -262,6 +292,8 @@ export class SignalService {
         ma200: ind.ma200.toFixed(2),
         reasoning: convergence.reasoning,
         signalId: saved.id,
+        recommendedQuantity: recommendedQty,
+        convergentCount: convergence.convergentCount,
       });
 
       if (messageId) {
@@ -294,5 +326,30 @@ export class SignalService {
     if (score >= 4) return type === 'BUY' ? 'STRONG_BUY' : 'STRONG_SELL';
     if (score >= 3) return type === 'BUY' ? 'BUY' : 'SELL';
     return 'NEUTRAL';
+  }
+
+  private calculateRecommendedQuantity(
+    convergentCount: number,
+    rsi: number,
+    rsiOversold: number,
+    signalType: 'BUY' | 'SELL',
+    buyingPower: number,
+    currentPrice: number,
+    riskProfile: string,
+  ): number {
+    if (currentPrice <= 0 || buyingPower <= 0) return 1;
+
+    // Base risk % of buying power by profile
+    const baseRiskPct = riskProfile === 'BAJO' ? 3 : riskProfile === 'ALTO' ? 8 : 5;
+
+    // Signal strength multiplier
+    const strengthMul = convergentCount >= 4 ? 1.5 : convergentCount >= 3 ? 1.25 : 1.0;
+
+    // RSI depth bonus for BUY (deeper oversold = stronger entry conviction)
+    const rsiDepth = signalType === 'BUY' ? Math.max(0, rsiOversold - rsi) : 0;
+    const rsiBonusMul = rsiDepth >= 5 ? 1.2 : 1.0;
+
+    const investAmount = buyingPower * (baseRiskPct / 100) * strengthMul * rsiBonusMul;
+    return Math.max(1, Math.round(investAmount / currentPrice));
   }
 }

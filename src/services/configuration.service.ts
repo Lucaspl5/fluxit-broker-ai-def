@@ -17,6 +17,10 @@ export class ConfigurationService {
           symbol: symbol.toUpperCase(),
           enabled: true,
           required_convergence: 2,
+          stop_loss_pct: 4.0,
+          take_profit_pct: 10.0,
+          max_risk_per_trade: 5.0,
+          volume_threshold_pct: 130,
         },
       });
       this.logger.log(`Created default configuration for ${symbol}`);

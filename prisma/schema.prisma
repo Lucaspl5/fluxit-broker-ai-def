@@ -22,11 +22,11 @@ model configuration {
   macd_signal_period   Int         @default(9)
   ma50_period          Int         @default(50)
   ma200_period         Int         @default(200)
-  volume_threshold_pct Decimal     @default(120)
+  volume_threshold_pct Decimal     @default(130)
   required_convergence Int         @default(2)
-  stop_loss_pct        Decimal     @default(2.0)
-  take_profit_pct      Decimal     @default(4.0)
-  max_risk_per_trade   Decimal     @default(2.0)
+  stop_loss_pct        Decimal     @default(4.0)
+  take_profit_pct      Decimal     @default(10.0)
+  max_risk_per_trade   Decimal     @default(5.0)
   created_at           DateTime    @default(now())
   updated_at           DateTime    @updatedAt
   signals              signal[]
@@ -60,6 +60,7 @@ model signal {
   risk_level            RiskLevel
   reasoning             String
   recommendation        String
+  recommended_quantity  Int           @default(1)
   telegram_message_id   Int?
   created_at            DateTime      @default(now())
   orders                order[]

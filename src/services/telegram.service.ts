@@ -13,6 +13,8 @@ export interface SignalMessage {
   ma200: string;
   reasoning: string;
   signalId: string;
+  recommendedQuantity: number;
+  convergentCount: number;
 }
 
 @Injectable()
@@ -202,17 +204,25 @@ export class TelegramService implements OnModuleInit {
     );
   }
 
-  private buildStatusText(): string {
+  private async buildStatusText(): Promise<string> {
+    const configs = await this.prisma.configuration.findMany({ where: { enabled: true } });
+    const cfg = configs[0];
+    const sl   = cfg ? Number(cfg.stop_loss_pct)    : '?';
+    const tp   = cfg ? Number(cfg.take_profit_pct)  : '?';
+    const risk = cfg ? Number(cfg.max_risk_per_trade): '?';
+    const conv = cfg ? cfg.required_convergence      : '?';
+
     return (
       '⚙️ <b>Estado del Sistema</b>\n\n' +
       '🟢 Backend: Activo\n' +
       '🟢 Alpaca: Paper Trading\n' +
       '🟢 Análisis: Cada 15 min\n' +
-      '📉 Stop Loss: -2%\n' +
-      '📈 Take Profit: +4%\n' +
-      '💰 Máx riesgo/trade: $2\n' +
-      '🎯 Convergencia mínima: 2 indicadores\n' +
-      '📊 Símbolos: 13 acciones monitoreadas'
+      `📉 Stop Loss: -${sl}%\n` +
+      `📈 Take Profit: +${tp}%\n` +
+      `💰 Máx riesgo/trade: ${risk}%\n` +
+      `🎯 Convergencia mínima: ${conv} indicadores\n` +
+      `📊 Símbolos monitoreados: ${configs.length}\n\n` +
+      `<i>Usa /limpiar para resetear señales y órdenes pendientes</i>`
     );
   }
 
@@ -242,14 +252,41 @@ export class TelegramService implements OnModuleInit {
           '❓ <b>Ayuda — Broker AI</b>\n\n' +
           'Analiza 13 acciones cada 15 minutos con 4 indicadores:\n' +
           '• RSI  • MACD  • MA50/MA200  • Volumen\n\n' +
-          'Cuando convergen los indicadores recibes una señal BUY/SELL con botones para autorizar o cancelar la orden.\n\n' +
+          'Cuando convergen los indicadores recibes una señal BUY/SELL con la <b>cantidad de acciones recomendada</b> por la IA según el poder de compra y la fuerza de la señal.\n\n' +
           '<b>Comandos:</b>\n' +
           '/menu — Dashboard principal\n' +
+          '/limpiar — Limpia señales antiguas y órdenes pendientes\n' +
           '/help — Esta ayuda',
           { parse_mode: 'HTML' },
         );
       } catch (e) {
         this.logger.error(`sendHelp error: ${e.message}`);
+      }
+    });
+
+    this.bot.onText(/^\/limpiar(@\S+)?$/i, async (msg) => {
+      const chat = String(msg.chat.id);
+      try {
+        const cancelled = await this.prisma.order.updateMany({
+          where: { status: 'PENDING' },
+          data: { status: 'CANCELLED', status_reason: 'Limpieza manual vía Telegram' },
+        });
+
+        const cleared = await this.prisma.signal.updateMany({
+          where: { telegram_message_id: { not: null } },
+          data: { telegram_message_id: null },
+        });
+
+        await this.bot!.sendMessage(chat,
+          `🧹 <b>Limpieza completada</b>\n\n` +
+          `✅ ${cancelled.count} órdenes pendientes canceladas\n` +
+          `✅ ${cleared.count} mensajes de señales limpiados\n\n` +
+          `El sistema está listo. Los botones de señales antiguas ya no funcionarán.`,
+          { parse_mode: 'HTML' },
+        );
+      } catch (e) {
+        this.logger.error(`/limpiar error: ${e.message}`);
+        await this.bot!.sendMessage(chat, '❌ Error durante la limpieza.').catch(() => {});
       }
     });
 
@@ -297,7 +334,7 @@ export class TelegramService implements OnModuleInit {
           case 'dash_orders':      sectionText = await this.buildOrdersText();      break;
           case 'dash_performance': sectionText = await this.buildPerformanceText(); break;
           case 'dash_account':     sectionText = await this.buildAccountText();     break;
-          case 'dash_status':      sectionText = this.buildStatusText();            break;
+          case 'dash_status':      sectionText = await this.buildStatusText();      break;
           default: return;
         }
 
@@ -458,13 +495,24 @@ export class TelegramService implements OnModuleInit {
       const slMul = orderSide === 'buy' ? 1 - Number(cfg.stop_loss_pct) / 100 : 1 + Number(cfg.stop_loss_pct) / 100;
       const tpMul = orderSide === 'buy' ? 1 + Number(cfg.take_profit_pct) / 100 : 1 - Number(cfg.take_profit_pct) / 100;
 
+      // Determine quantity: BUY uses recommended_quantity, SELL uses open position size
+      let orderQty = signal.recommended_quantity ?? 1;
+      let sellOpenPerf: { id: string; entry_price: any; quantity: any; entry_time: Date; configuration_id: string } | null = null;
+      if (orderSide === 'sell') {
+        sellOpenPerf = await this.prisma.performance.findFirst({
+          where: { symbol: signal.symbol, status: 'OPEN' },
+          orderBy: { entry_time: 'asc' },
+        });
+        orderQty = sellOpenPerf ? Number(sellOpenPerf.quantity) : 1;
+      }
+
       const savedOrder = await this.prisma.order.create({
         data: {
           configuration_id: cfg.id,
           signal_id: signalId,
           symbol: signal.symbol,
           order_type: orderSide.toUpperCase() as 'BUY' | 'SELL',
-          quantity: 1,
+          quantity: orderQty,
           price,
           stop_loss_price: price * slMul,
           take_profit_price: price * tpMul,
@@ -485,34 +533,30 @@ export class TelegramService implements OnModuleInit {
             symbol: signal.symbol,
             entry_price: price,
             entry_time: now,
-            quantity: 1,
+            quantity: orderQty,
             status: 'OPEN',
           },
         });
-      } else {
-        const openPerf = await this.prisma.performance.findFirst({
-          where: { symbol: signal.symbol, status: 'OPEN' },
-          orderBy: { entry_time: 'asc' },
+      } else if (sellOpenPerf) {
+        const entry = Number(sellOpenPerf.entry_price);
+        const qty = Number(sellOpenPerf.quantity);
+        const pl = (price - entry) * qty;
+        const plPct = ((price - entry) / entry) * 100;
+        const duration = Math.floor((now.getTime() - new Date(sellOpenPerf.entry_time).getTime()) / 1000);
+        await this.prisma.performance.update({
+          where: { id: sellOpenPerf.id },
+          data: { exit_price: price, exit_time: now, profit_loss: pl, profit_loss_pct: plPct, duration_seconds: duration, status: 'CLOSED' },
         });
-        if (openPerf) {
-          const entry = Number(openPerf.entry_price);
-          const pl = (price - entry) * 1;
-          const plPct = ((price - entry) / entry) * 100;
-          const duration = Math.floor((now.getTime() - new Date(openPerf.entry_time).getTime()) / 1000);
-          await this.prisma.performance.update({
-            where: { id: openPerf.id },
-            data: { exit_price: price, exit_time: now, profit_loss: pl, profit_loss_pct: plPct, duration_seconds: duration, status: 'CLOSED' },
-          });
-        }
       }
 
       await this.bot.editMessageText(
-        `✅ <b>Orden ${orderSide === 'buy' ? 'BUY' : 'SELL'} registrada — ${signal.symbol} a $${price.toFixed(2)}</b>\n⏳ Enviando a Alpaca...`,
+        `✅ <b>Orden ${orderSide === 'buy' ? 'BUY' : 'SELL'} registrada — ${signal.symbol} a $${price.toFixed(2)}</b>\n` +
+        `📦 Cantidad: ${orderQty} acciones\n⏳ Enviando a Alpaca...`,
         { chat_id: chat, message_id: msgId, parse_mode: 'HTML', reply_markup: this.backKeyboard() },
       );
-      this.logger.log(`Order registered: signal=${signalId} side=${orderSide} symbol=${signal.symbol}`);
+      this.logger.log(`Order registered: signal=${signalId} side=${orderSide} symbol=${signal.symbol} qty=${orderQty}`);
 
-      this.alpaca.executeOrder({ symbol: signal.symbol, qty: 1, side: orderSide, type: 'market' })
+      this.alpaca.executeOrder({ symbol: signal.symbol, qty: orderQty, side: orderSide, type: 'market' })
         .then(async (alpacaOrder) => {
           const status = alpacaOrder ? '✅ Ejecutada en Alpaca' : '⚠️ Mercado cerrado — se ejecutará en apertura';
           await this.prisma.order.update({
@@ -590,16 +634,22 @@ export class TelegramService implements OnModuleInit {
 
     try {
       const emoji = msg.signalType === 'BUY' ? '🟢' : '🔴';
+      const estimatedInvestment = (msg.recommendedQuantity * Number(msg.price)).toLocaleString('en-US', { maximumFractionDigits: 0 });
+      const qtyLine = msg.signalType === 'BUY'
+        ? `\n💡 <b>Cantidad recomendada: ${msg.recommendedQuantity} acciones</b>\n💵 Inversión estimada: ~$${estimatedInvestment}`
+        : `\n💡 <b>Vender: ${msg.recommendedQuantity} acciones (posición completa)</b>`;
       const text =
         `${emoji} <b>Señal ${msg.signalType} detectada</b>\n\n` +
         `📊 Símbolo: <b>${msg.symbol}</b>\n` +
-        `💹 Precio: <b>$${msg.price}</b>\n\n` +
+        `💹 Precio: <b>$${msg.price}</b>\n` +
+        `🎯 Score: ${msg.convergentCount}/5 indicadores\n\n` +
         `📈 Indicadores:\n` +
         `  • RSI: ${msg.rsi}\n` +
         `  • MACD: ${msg.macd}\n` +
         `  • MA50: $${msg.ma50}\n` +
         `  • MA200: $${msg.ma200}\n\n` +
-        `📝 Análisis: ${msg.reasoning}\n\n` +
+        `📝 Análisis: ${msg.reasoning}` +
+        `${qtyLine}\n\n` +
         `¿Ejecutar la orden?`;
 
       const sent = await this.bot.sendMessage(this.chatId, text, {
