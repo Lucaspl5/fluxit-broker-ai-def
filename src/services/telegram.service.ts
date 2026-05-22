@@ -264,12 +264,49 @@ export class TelegramService implements OnModuleInit {
           'Cuando convergen los indicadores recibes una señal BUY/SELL con la <b>cantidad de acciones recomendada</b> por la IA según el poder de compra y la fuerza de la señal.\n\n' +
           '<b>Comandos:</b>\n' +
           '/menu — Dashboard principal\n' +
+          '/disable SYMBOL — Desactiva monitoreo de un símbolo (ej: /disable AAPL)\n' +
+          '/enable SYMBOL — Reactiva monitoreo de un símbolo\n' +
           '/limpiar — Limpia señales antiguas y órdenes pendientes\n' +
           '/help — Esta ayuda',
           { parse_mode: 'HTML' },
         );
       } catch (e) {
         this.logger.error(`sendHelp error: ${e.message}`);
+      }
+    });
+
+    this.bot.onText(/^\/disable(?:@\S+)?\s+(\S+)$/i, async (msg, match) => {
+      const chat = String(msg.chat.id);
+      const symbol = match![1].toUpperCase();
+      try {
+        await this.prisma.configuration.updateMany({
+          where: { symbol },
+          data: { enabled: false },
+        });
+        await this.bot!.sendMessage(chat,
+          `🚫 <b>${symbol}</b> desactivado. El bot ya no monitoreará este símbolo.`,
+          { parse_mode: 'HTML' },
+        );
+      } catch (e) {
+        await this.bot!.sendMessage(chat, `❌ Error desactivando ${symbol}: ${e.message}`);
+      }
+    });
+
+    this.bot.onText(/^\/enable(?:@\S+)?\s+(\S+)$/i, async (msg, match) => {
+      const chat = String(msg.chat.id);
+      const symbol = match![1].toUpperCase();
+      try {
+        await this.prisma.configuration.upsert({
+          where: { symbol },
+          update: { enabled: true },
+          create: { symbol, enabled: true },
+        });
+        await this.bot!.sendMessage(chat,
+          `✅ <b>${symbol}</b> activado. El bot volverá a monitorear este símbolo.`,
+          { parse_mode: 'HTML' },
+        );
+      } catch (e) {
+        await this.bot!.sendMessage(chat, `❌ Error activando ${symbol}: ${e.message}`);
       }
     });
 
