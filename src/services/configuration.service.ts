@@ -21,6 +21,12 @@ export class ConfigurationService {
           take_profit_pct: 10.0,
           max_risk_per_trade: 5.0,
           volume_threshold_pct: 130,
+          trailing_stop_pct: 2.0,
+          max_open_positions: 5,
+          use_kelly: true,
+          kelly_fraction: 0.5,
+          regime_filter: true,
+          use_sentiment: false,
         },
       });
       this.logger.log(`Created default configuration for ${symbol}`);

@@ -15,6 +15,15 @@ export interface SignalMessage {
   signalId: string;
   recommendedQuantity: number;
   convergentCount: number;
+  // New fields from advanced analysis
+  atr?: number;
+  bbUpper?: number;
+  bbLower?: number;
+  tfAlignment?: string;
+  regimeBullish?: boolean;
+  sentimentScore?: number;
+  atrStopLoss?: number;
+  atrTakeProfit?: number;
 }
 
 @Injectable()
@@ -556,16 +565,37 @@ export class TelegramService implements OnModuleInit {
       );
       this.logger.log(`Order registered: signal=${signalId} side=${orderSide} symbol=${signal.symbol} qty=${orderQty}`);
 
-      this.alpaca.executeOrder({ symbol: signal.symbol, qty: orderQty, side: orderSide, type: 'market' })
-        .then(async (alpacaOrder) => {
-          const status = alpacaOrder ? '✅ Ejecutada en Alpaca' : '⚠️ Mercado cerrado — se ejecutará en apertura';
+      // Bug fix: use executeOrderWithStatus to correctly distinguish market_closed from actual failures
+      this.alpaca.executeOrderWithStatus({ symbol: signal.symbol, qty: orderQty, side: orderSide, type: 'market' })
+        .then(async (result) => {
+          let statusMsg: string;
+          let statusReason: string | undefined;
+
+          if (result.status === 'filled') {
+            statusMsg = '✅ Ejecutada en Alpaca';
+          } else if (result.status === 'pending_open') {
+            statusMsg = '⏳ Orden enviada — pendiente de ejecución en Alpaca';
+            statusReason = 'Pending Alpaca fill';
+          } else if (result.status === 'market_closed') {
+            statusMsg = '⚠️ Mercado cerrado — se ejecutará en la apertura';
+            statusReason = 'Market closed';
+          } else {
+            statusMsg = `❌ Error en Alpaca: ${result.errorMessage ?? 'unknown'}`;
+            statusReason = result.errorMessage ?? 'Failed';
+          }
+
           await this.prisma.order.update({
             where: { id: savedOrder.id },
-            data: { alpaca_order_id: alpacaOrder?.id ?? null, status_reason: alpacaOrder ? undefined : 'Market closed' },
+            data: {
+              alpaca_order_id: result.order?.id ?? null,
+              status_reason: statusReason,
+              status: result.order ? 'EXECUTED' : (result.status === 'failed' ? 'FAILED' : 'EXECUTED'),
+            },
           });
+
           if (this.chatId) {
             await this.bot!.sendMessage(this.chatId,
-              `${status}: <b>${signal.symbol}</b> ${orderSide.toUpperCase()} $${price.toFixed(2)}`,
+              `${statusMsg}: <b>${signal.symbol}</b> ${orderSide.toUpperCase()} $${price.toFixed(2)}`,
               { parse_mode: 'HTML' },
             );
           }
@@ -638,17 +668,49 @@ export class TelegramService implements OnModuleInit {
       const qtyLine = msg.signalType === 'BUY'
         ? `\n💡 <b>Cantidad recomendada: ${msg.recommendedQuantity} acciones</b>\n💵 Inversión estimada: ~$${estimatedInvestment}`
         : `\n💡 <b>Vender: ${msg.recommendedQuantity} acciones (posición completa)</b>`;
+
+      // ATR-based SL/TP
+      const slTpLine = msg.atrStopLoss != null
+        ? `\n🛡️ ATR SL: $${msg.atrStopLoss.toFixed(2)}  🎯 ATR TP: $${msg.atrTakeProfit?.toFixed(2) ?? '—'}`
+        : '';
+
+      // Bollinger Bands position
+      const bbLine = msg.bbLower != null
+        ? `  • BB: [$${msg.bbLower.toFixed(2)} — $${msg.bbUpper?.toFixed(2) ?? '—'}]\n`
+        : '';
+
+      // ATR
+      const atrLine = msg.atr != null ? `  • ATR: ${msg.atr.toFixed(2)}\n` : '';
+
+      // Multi-timeframe
+      const tfLine = msg.tfAlignment ? `📡 Timeframes: ${msg.tfAlignment}\n` : '';
+
+      // Regime
+      const regimeLine = msg.regimeBullish != null
+        ? `🌍 Mercado: ${msg.regimeBullish ? '🐂 Alcista (SPY > MA200)' : '🐻 Bajista (SPY < MA200)'}\n`
+        : '';
+
+      // Sentiment
+      const sentLine = msg.sentimentScore != null
+        ? `📰 Sentimiento: ${msg.sentimentScore >= 0.15 ? '😊' : msg.sentimentScore <= -0.15 ? '😟' : '😐'} ${msg.sentimentScore.toFixed(2)}\n`
+        : '';
+
       const text =
         `${emoji} <b>Señal ${msg.signalType} detectada</b>\n\n` +
         `📊 Símbolo: <b>${msg.symbol}</b>\n` +
         `💹 Precio: <b>$${msg.price}</b>\n` +
-        `🎯 Score: ${msg.convergentCount}/5 indicadores\n\n` +
-        `📈 Indicadores:\n` +
+        `🎯 Score: ${msg.convergentCount}/7 indicadores\n\n` +
+        `📈 Indicadores técnicos:\n` +
         `  • RSI: ${msg.rsi}\n` +
         `  • MACD: ${msg.macd}\n` +
-        `  • MA50: $${msg.ma50}\n` +
-        `  • MA200: $${msg.ma200}\n\n` +
-        `📝 Análisis: ${msg.reasoning}` +
+        `  • MA50: $${msg.ma50}  MA200: $${msg.ma200}\n` +
+        `${bbLine}` +
+        `${atrLine}` +
+        `${tfLine}` +
+        `${regimeLine}` +
+        `${sentLine}` +
+        `\n📝 Análisis: ${msg.reasoning}` +
+        `${slTpLine}` +
         `${qtyLine}\n\n` +
         `¿Ejecutar la orden?`;
 

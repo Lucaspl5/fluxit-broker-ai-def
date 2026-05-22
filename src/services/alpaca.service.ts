@@ -12,6 +12,14 @@ export interface MarketBar {
   volume: number;
 }
 
+export type OrderExecutionStatus = 'filled' | 'pending_open' | 'market_closed' | 'failed';
+
+export interface OrderExecutionResult {
+  order: any | null;
+  status: OrderExecutionStatus;
+  errorMessage?: string;
+}
+
 @Injectable()
 export class AlpacaService {
   private readonly logger = new Logger(AlpacaService.name);
@@ -26,12 +34,7 @@ export class AlpacaService {
       return;
     }
 
-    this.alpaca = new AlpacaAPI({
-      keyId: apiKey,
-      secretKey,
-      paper: true,
-    });
-
+    this.alpaca = new AlpacaAPI({ keyId: apiKey, secretKey, paper: true });
     this.logger.log('Alpaca client initialized (paper trading)');
   }
 
@@ -39,8 +42,10 @@ export class AlpacaService {
     if (!this.alpaca) return [];
 
     try {
+      // Request extra days to account for weekends/holidays
+      const lookbackDays = timeframe === '1Day' ? limit * 2 : timeframe.includes('Hour') ? Math.ceil(limit / 6) + 30 : 10;
       const start = new Date();
-      start.setDate(start.getDate() - limit * 2);
+      start.setDate(start.getDate() - lookbackDays);
 
       const iterator = await this.alpaca.getBarsV2(symbol, {
         timeframe,
@@ -72,19 +77,20 @@ export class AlpacaService {
 
       return bars.sort((a, b) => a.timestamp - b.timestamp);
     } catch (error) {
-      this.logger.error(`getHistoricalData(${symbol}): ${error.message}`);
+      this.logger.error(`getHistoricalData(${symbol} ${timeframe}): ${error.message}`);
       return [];
     }
   }
 
-  async executeOrder(params: {
+  // Returns detailed execution result — distinguishes market_closed from actual failures
+  async executeOrderWithStatus(params: {
     symbol: string;
     qty: number;
     side: 'buy' | 'sell';
     type: 'market' | 'limit';
     limit_price?: number;
-  }): Promise<any | null> {
-    if (!this.alpaca) return null;
+  }): Promise<OrderExecutionResult> {
+    if (!this.alpaca) return { order: null, status: 'failed', errorMessage: 'Alpaca not initialized' };
 
     try {
       const order = await this.alpaca.createOrder({
@@ -95,12 +101,39 @@ export class AlpacaService {
         time_in_force: 'day',
         ...(params.limit_price ? { limit_price: params.limit_price } : {}),
       });
-      this.logger.log(`Order placed: ${order.id} ${params.side} ${params.symbol}`);
-      return order;
+      this.logger.log(`Order placed: ${order.id} ${params.side} ${params.symbol} status=${order.status}`);
+
+      // Alpaca returns status: 'filled' (immediate) or 'accepted'/'pending_new' (market closed / queue)
+      const filled = order.status === 'filled' || order.status === 'partially_filled';
+      if (filled) return { order, status: 'filled' };
+
+      // Distinguish market closed from other pending states
+      const marketOpen = await this.isMarketOpen();
+      return { order, status: marketOpen ? 'pending_open' : 'market_closed' };
     } catch (error) {
-      this.logger.error(`executeOrder(${params.symbol}): ${error.message}`);
-      return null;
+      const msg: string = error.message ?? '';
+      this.logger.error(`executeOrder(${params.symbol}): ${msg}`);
+
+      // Alpaca returns 422 with "market is closed" when extended_hours is not enabled
+      const isMarketClosed = /market.*closed|outside.*hours|after.?hours/i.test(msg);
+      return {
+        order: null,
+        status: isMarketClosed ? 'market_closed' : 'failed',
+        errorMessage: msg,
+      };
     }
+  }
+
+  // Legacy helper kept for internal SL/TP auto-close calls
+  async executeOrder(params: {
+    symbol: string;
+    qty: number;
+    side: 'buy' | 'sell';
+    type: 'market' | 'limit';
+    limit_price?: number;
+  }): Promise<any | null> {
+    const result = await this.executeOrderWithStatus(params);
+    return result.order;
   }
 
   async cancelOrder(alpacaOrderId: string): Promise<boolean> {
@@ -131,9 +164,9 @@ export class AlpacaService {
       return clock.is_open === true;
     } catch (error) {
       this.logger.error(`getClock: ${error.message}`);
-      // Fallback: check NYSE hours by UTC time (Mon-Fri 13:30-21:00 UTC)
+      // Fallback: NYSE hours Mon-Fri 13:30-21:00 UTC
       const now = new Date();
-      const day = now.getUTCDay(); // 0=Sun, 6=Sat
+      const day = now.getUTCDay();
       if (day === 0 || day === 6) return false;
       const h = now.getUTCHours() * 60 + now.getUTCMinutes();
       return h >= 13 * 60 + 30 && h < 21 * 60;
@@ -143,10 +176,8 @@ export class AlpacaService {
   async getLatestPrice(symbol: string): Promise<number | null> {
     if (!this.alpaca) return null;
     try {
-      // Use 1-minute bars for a near real-time price instead of stale daily close
       const bars = await this.getHistoricalData(symbol, '1Min', 5);
       if (bars.length > 0) return bars[bars.length - 1].close;
-      // Fallback to daily if no intraday data (market closed)
       const daily = await this.getHistoricalData(symbol, '1Day', 1);
       return daily.length > 0 ? daily[daily.length - 1].close : null;
     } catch (error) {

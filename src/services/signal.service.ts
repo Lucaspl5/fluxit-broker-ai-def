@@ -5,6 +5,7 @@ import { AlpacaService } from './alpaca.service';
 import { TechnicalAnalysisService } from './technical-analysis.service';
 import { TelegramService } from './telegram.service';
 import { ConfigurationService } from './configuration.service';
+import { SentimentService } from './sentiment.service';
 import { signal as SignalModel } from '@prisma/client';
 import Decimal from 'decimal.js';
 
@@ -19,6 +20,7 @@ export class SignalService implements OnApplicationBootstrap {
     private ta: TechnicalAnalysisService,
     private telegram: TelegramService,
     private config: ConfigurationService,
+    private sentiment: SentimentService,
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
@@ -73,7 +75,7 @@ export class SignalService implements OnApplicationBootstrap {
 
     const openPositions = await this.prisma.performance.findMany({
       where: { status: 'OPEN' },
-      include: { buy_order: true },
+      include: { buy_order: true, configuration: true },
     });
     if (openPositions.length === 0) return;
 
@@ -88,8 +90,7 @@ export class SignalService implements OnApplicationBootstrap {
       if (!currentPrice) continue;
 
       const ref = positions[0];
-      const sl  = Number(ref.buy_order.stop_loss_price ?? 0);
-      const tp  = Number(ref.buy_order.take_profit_price ?? 0);
+      const cfg = ref.configuration;
 
       const ageMs = Date.now() - new Date(ref.entry_time).getTime();
       if (ageMs < 4 * 60 * 60 * 1000) {
@@ -97,23 +98,43 @@ export class SignalService implements OnApplicationBootstrap {
         continue;
       }
 
-      const hitSL = sl > 0 && currentPrice <= sl;
+      // Update trailing stop if price moved in our favour
+      const trailPct = Number(cfg.trailing_stop_pct ?? 2);
+      const newTrailingStop = currentPrice * (1 - trailPct / 100);
+      const currentHighest  = Number(ref.highest_price ?? ref.entry_price);
+      const currentTrailSL  = Number(ref.trailing_stop_price ?? 0);
+
+      if (currentPrice > currentHighest) {
+        await this.prisma.performance.update({
+          where: { id: ref.id },
+          data: {
+            highest_price: new Decimal(currentPrice),
+            trailing_stop_price: new Decimal(newTrailingStop),
+          },
+        });
+        this.logger.log(`${symbol}: trailing stop raised to $${newTrailingStop.toFixed(2)} (price=$${currentPrice})`);
+      }
+
+      const sl = Number(ref.buy_order.stop_loss_price ?? 0);
+      const tp = Number(ref.buy_order.take_profit_price ?? 0);
+
+      // Use the most protective stop: whichever is higher between fixed SL and trailing SL
+      const effectiveSL = Math.max(sl, currentTrailSL);
+
+      const hitSL = effectiveSL > 0 && currentPrice <= effectiveSL;
       const hitTP = tp > 0 && currentPrice >= tp;
 
       if (!hitSL && !hitTP) continue;
 
-      // Re-fetch to confirm position is still OPEN (prevents duplicate closes)
-      const stillOpen = await this.prisma.performance.findFirst({
-        where: { id: ref.id, status: 'OPEN' },
-      });
+      const stillOpen = await this.prisma.performance.findFirst({ where: { id: ref.id, status: 'OPEN' } });
       if (!stillOpen) {
         this.logger.warn(`${symbol}: position already closed, skipping`);
         continue;
       }
 
-      const reason  = hitSL ? 'Stop Loss' : 'Take Profit';
+      const reason   = hitSL ? (currentTrailSL > sl ? 'Trailing Stop' : 'Stop Loss') : 'Take Profit';
       const exitTime = new Date();
-      let totalPL = 0;
+      let totalPL    = 0;
 
       this.logger.log(`${symbol}: ${reason} triggered at $${currentPrice} — closing ${positions.length} position(s)`);
 
@@ -138,16 +159,15 @@ export class SignalService implements OnApplicationBootstrap {
         });
       }
 
-      const alpacaOrder = await this.alpaca.executeOrder({
-        symbol, qty: positions.reduce((s, p) => s + Number(p.quantity), 0), side: 'sell', type: 'market',
-      });
+      const totalQty   = positions.reduce((s, p) => s + Number(p.quantity), 0);
+      const alpacaOrder = await this.alpaca.executeOrder({ symbol, qty: totalQty, side: 'sell', type: 'market' });
 
       await this.prisma.order.create({
         data: {
           configuration_id: ref.configuration_id,
           symbol,
           order_type: 'SELL',
-          quantity: positions.reduce((s, p) => s + Number(p.quantity), 0),
+          quantity: totalQty,
           price: new Decimal(currentPrice),
           max_risk_eur: ref.buy_order.max_risk_eur,
           status: alpacaOrder ? 'EXECUTED' : 'CANCELLED',
@@ -179,42 +199,97 @@ export class SignalService implements OnApplicationBootstrap {
     try {
       const cfg = await this.config.ensureConfiguration(symbol);
 
+      // === MARKET REGIME FILTER ===
+      // Only take BUY signals when the broad market (SPY) is above its MA200
+      let regimeBullish = true;
+      if (cfg.regime_filter && symbol !== 'SPY') {
+        const spyBars = await this.alpaca.getHistoricalData('SPY', '1Day', 220);
+        if (spyBars.length >= 200) {
+          const spyPrices = spyBars.map(b => b.close);
+          const spyMa200  = spyPrices.slice(-200).reduce((a, b) => a + b, 0) / 200;
+          regimeBullish   = spyPrices.at(-1)! > spyMa200;
+          this.logger.log(`Market regime: SPY $${spyPrices.at(-1)!.toFixed(2)} vs MA200 $${spyMa200.toFixed(2)} — ${regimeBullish ? 'BULLISH' : 'BEARISH'}`);
+        }
+      }
+
+      // === DAILY BARS (primary) ===
       const bars = await this.alpaca.getHistoricalData(symbol, '1Day', cfg.ma200_period + 50);
       if (bars.length === 0) {
         this.logger.warn(`No market data for ${symbol}`);
         return null;
       }
 
-      const prices = bars.map((b) => b.close);
-      const volumes = bars.map((b) => b.volume);
-      const currentPrice = prices.at(-1);
+      const prices  = bars.map(b => b.close);
+      const highs   = bars.map(b => b.high);
+      const lows    = bars.map(b => b.low);
+      const volumes = bars.map(b => b.volume);
+      const currentPrice = prices.at(-1)!;
 
       const ind = this.ta.calculateIndicators(
-        prices, volumes,
+        prices, highs, lows, volumes,
         cfg.rsi_period, cfg.macd_fast_period, cfg.macd_slow_period,
         cfg.macd_signal_period, cfg.ma50_period, cfg.ma200_period,
       );
       if (!ind) return null;
 
+      // === MULTI-TIMEFRAME: 4H and 1H ===
+      const [bars4h, bars1h] = await Promise.all([
+        this.alpaca.getHistoricalData(symbol, '4Hour', 120),
+        this.alpaca.getHistoricalData(symbol, '1Hour', 100),
+      ]);
+
+      const ind4h = bars4h.length >= 60
+        ? this.ta.calculateIndicators(bars4h.map(b => b.close), bars4h.map(b => b.high), bars4h.map(b => b.low), bars4h.map(b => b.volume), 14, 12, 26, 9, 20, 50)
+        : null;
+
+      const ind1h = bars1h.length >= 40
+        ? this.ta.calculateIndicators(bars1h.map(b => b.close), bars1h.map(b => b.high), bars1h.map(b => b.low), bars1h.map(b => b.volume), 14, 12, 26, 9, 20, 50)
+        : null;
+
       this.logger.log(
-        `${symbol}: price=$${currentPrice.toFixed(2)} RSI=${ind.rsi.toFixed(1)} MACD=${ind.macd.toFixed(4)} MA50=${ind.ma50.toFixed(2)} MA200=${ind.ma200.toFixed(2)}`,
+        `${symbol}: $${currentPrice.toFixed(2)} RSI=${ind.rsi.toFixed(1)} MACD=${ind.macd.toFixed(4)} ATR=${ind.atr.toFixed(2)} BB[${ind.bbLower.toFixed(2)}-${ind.bbUpper.toFixed(2)}]`,
       );
 
       const recentVol = volumes.slice(-20);
-      const avgVol = recentVol.reduce((a, b) => a + b, 0) / recentVol.length;
-      const volRatio = volumes.at(-1) / avgVol;
+      const avgVol    = recentVol.reduce((a, b) => a + b, 0) / recentVol.length;
+      const volRatio  = volumes.at(-1)! / avgVol;
 
       const convergence = this.ta.detectConvergenceSignal(
-        ind, cfg.rsi_overbought, cfg.rsi_oversold, cfg.required_convergence, volRatio,
+        ind, cfg.rsi_overbought, cfg.rsi_oversold, cfg.required_convergence, volRatio, ind4h, ind1h,
       );
       if (!convergence) return null;
 
+      // Block BUY in bear regime (still allow SELL)
+      if (convergence.type === 'BUY' && !regimeBullish) {
+        this.logger.log(`${symbol}: skipping BUY — market in bear regime (SPY below MA200)`);
+        return null;
+      }
+
+      // === SENTIMENT FILTER ===
+      let sentimentScore = 0;
+      if (cfg.use_sentiment) {
+        const sentimentResult = await this.sentiment.getSentiment(symbol);
+        sentimentScore = sentimentResult.score;
+        if (convergence.type === 'BUY' && this.sentiment.isSentimentBlocking(sentimentResult)) {
+          this.logger.log(`${symbol}: skipping BUY — bearish sentiment (${sentimentResult.summary})`);
+          return null;
+        }
+      }
+
+      // === POSITION GUARDS ===
       if (convergence.type === 'BUY') {
         const openPosition = await this.prisma.performance.findFirst({
           where: { symbol: symbol.toUpperCase(), status: 'OPEN' },
         });
         if (openPosition) {
           this.logger.log(`${symbol}: skipping BUY — already have an open position`);
+          return null;
+        }
+
+        // === POSITION LIMIT (Improvement 6) ===
+        const totalOpen = await this.prisma.performance.count({ where: { status: 'OPEN' } });
+        if (totalOpen >= cfg.max_open_positions) {
+          this.logger.log(`${symbol}: skipping BUY — max open positions reached (${totalOpen}/${cfg.max_open_positions})`);
           return null;
         }
 
@@ -242,18 +317,15 @@ export class SignalService implements OnApplicationBootstrap {
         }
       }
 
-      // Calculate recommended quantity using Alpaca buying power
-      const account = await this.alpaca.getAccount();
+      // === POSITION SIZING: Kelly Criterion ===
+      const account     = await this.alpaca.getAccount();
       const buyingPower = account ? Number(account.buying_power ?? 0) : 0;
-      const recommendedQty = this.calculateRecommendedQuantity(
-        convergence.convergentCount,
-        ind.rsi,
-        cfg.rsi_oversold,
-        convergence.type as 'BUY' | 'SELL',
-        buyingPower,
-        currentPrice,
-        cfg.risk_profile,
-      );
+      const recommendedQty = cfg.use_kelly
+        ? await this.calculateKellyQuantity(symbol, cfg, buyingPower, currentPrice, convergence.convergentCount, ind.rsi)
+        : this.calculateRecommendedQuantity(convergence.convergentCount, ind.rsi, cfg.rsi_oversold, convergence.type as 'BUY' | 'SELL', buyingPower, currentPrice, cfg.risk_profile);
+
+      // === ATR-BASED SL/TP ===
+      const atrLevels = this.ta.calculateAtrLevels(currentPrice, ind.atr, convergence.type as 'BUY' | 'SELL');
 
       const saved = await this.prisma.signal.create({
         data: {
@@ -267,7 +339,7 @@ export class SignalService implements OnApplicationBootstrap {
           ma50: new Decimal(ind.ma50),
           ma200: new Decimal(ind.ma200),
           current_price: new Decimal(currentPrice),
-          volume: BigInt(volumes.at(-1)),
+          volume: BigInt(volumes.at(-1)!),
           avg_volume: BigInt(Math.round(avgVol)),
           volume_ratio: new Decimal(volRatio),
           convergent_indicators: convergence.convergentCount,
@@ -277,10 +349,16 @@ export class SignalService implements OnApplicationBootstrap {
           recommendation: this.toRecommendation(convergence.type, convergence.convergentCount),
           reasoning: convergence.reasoning,
           recommended_quantity: recommendedQty,
+          atr: new Decimal(ind.atr),
+          bb_upper: new Decimal(ind.bbUpper),
+          bb_lower: new Decimal(ind.bbLower),
+          sentiment_score: new Decimal(sentimentScore),
+          regime_bullish: regimeBullish,
+          tf_alignment: convergence.tfAlignment,
         },
       });
 
-      this.logger.log(`Signal saved: ${symbol} ${convergence.type} (${convergence.convergentCount} indicators, qty=${recommendedQty})`);
+      this.logger.log(`Signal saved: ${symbol} ${convergence.type} (${convergence.convergentCount} indicators, qty=${recommendedQty}, ATR SL=$${atrLevels.stopLoss.toFixed(2)})`);
 
       const messageId = await this.telegram.sendSignalNotification({
         symbol,
@@ -294,13 +372,18 @@ export class SignalService implements OnApplicationBootstrap {
         signalId: saved.id,
         recommendedQuantity: recommendedQty,
         convergentCount: convergence.convergentCount,
+        atr: ind.atr,
+        bbUpper: ind.bbUpper,
+        bbLower: ind.bbLower,
+        tfAlignment: convergence.tfAlignment,
+        regimeBullish,
+        sentimentScore: cfg.use_sentiment ? sentimentScore : undefined,
+        atrStopLoss: atrLevels.stopLoss,
+        atrTakeProfit: atrLevels.takeProfit,
       });
 
       if (messageId) {
-        await this.prisma.signal.update({
-          where: { id: saved.id },
-          data: { telegram_message_id: messageId },
-        });
+        await this.prisma.signal.update({ where: { id: saved.id }, data: { telegram_message_id: messageId } });
       }
 
       return saved;
@@ -308,6 +391,53 @@ export class SignalService implements OnApplicationBootstrap {
       this.logger.error(`analyzeSymbol(${symbol}): ${error.message}`);
       return null;
     }
+  }
+
+  private async calculateKellyQuantity(
+    symbol: string,
+    cfg: any,
+    buyingPower: number,
+    currentPrice: number,
+    convergentCount: number,
+    rsi: number,
+  ): Promise<number> {
+    if (currentPrice <= 0 || buyingPower <= 0) return 1;
+
+    const kellyFraction = Number(cfg.kelly_fraction ?? 0.5);
+    const tpPct = Number(cfg.take_profit_pct ?? 10);
+    const slPct = Number(cfg.stop_loss_pct ?? 4);
+
+    // Get historical win rate from closed trades
+    const closedTrades = await this.prisma.performance.findMany({
+      where: { symbol: symbol.toUpperCase(), status: 'CLOSED', profit_loss: { not: null } },
+      take: 50,
+    });
+
+    let p: number;
+    let b: number;
+
+    if (closedTrades.length >= 10) {
+      const wins   = closedTrades.filter(t => Number(t.profit_loss) > 0);
+      p = wins.length / closedTrades.length;
+      const avgWin  = wins.length > 0 ? wins.reduce((s, t) => s + Number(t.profit_loss_pct ?? 0), 0) / wins.length : tpPct;
+      const losses  = closedTrades.filter(t => Number(t.profit_loss) <= 0);
+      const avgLoss = losses.length > 0 ? Math.abs(losses.reduce((s, t) => s + Number(t.profit_loss_pct ?? 0), 0) / losses.length) : slPct;
+      b = avgLoss > 0 ? avgWin / avgLoss : tpPct / slPct;
+    } else {
+      // No history — use theoretical values from config
+      p = 0.5;
+      b = tpPct / slPct;
+    }
+
+    // Kelly formula: f* = (p*b - (1-p)) / b
+    const kelly = b > 0 ? (p * b - (1 - p)) / b : 0;
+    const safeFraction = Math.max(0.01, Math.min(kelly * kellyFraction, 0.25)); // cap at 25% of capital
+
+    // Convergence strength bonus (stronger signal → slightly more size)
+    const strengthBonus = convergentCount >= 5 ? 1.2 : convergentCount >= 4 ? 1.1 : 1.0;
+    const investAmount = buyingPower * safeFraction * strengthBonus;
+
+    return Math.max(1, Math.round(investAmount / currentPrice));
   }
 
   async getRecentSignals(limit = 20): Promise<SignalModel[]> {
@@ -339,15 +469,10 @@ export class SignalService implements OnApplicationBootstrap {
   ): number {
     if (currentPrice <= 0 || buyingPower <= 0) return 1;
 
-    // Base risk % of buying power by profile
-    const baseRiskPct = riskProfile === 'BAJO' ? 3 : riskProfile === 'ALTO' ? 8 : 5;
-
-    // Signal strength multiplier
-    const strengthMul = convergentCount >= 4 ? 1.5 : convergentCount >= 3 ? 1.25 : 1.0;
-
-    // RSI depth bonus for BUY (deeper oversold = stronger entry conviction)
-    const rsiDepth = signalType === 'BUY' ? Math.max(0, rsiOversold - rsi) : 0;
-    const rsiBonusMul = rsiDepth >= 5 ? 1.2 : 1.0;
+    const baseRiskPct  = riskProfile === 'BAJO' ? 3 : riskProfile === 'ALTO' ? 8 : 5;
+    const strengthMul  = convergentCount >= 4 ? 1.5 : convergentCount >= 3 ? 1.25 : 1.0;
+    const rsiDepth     = signalType === 'BUY' ? Math.max(0, rsiOversold - rsi) : 0;
+    const rsiBonusMul  = rsiDepth >= 5 ? 1.2 : 1.0;
 
     const investAmount = buyingPower * (baseRiskPct / 100) * strengthMul * rsiBonusMul;
     return Math.max(1, Math.round(investAmount / currentPrice));

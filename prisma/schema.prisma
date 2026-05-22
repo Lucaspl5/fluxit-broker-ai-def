@@ -27,6 +27,13 @@ model configuration {
   stop_loss_pct        Decimal     @default(4.0)
   take_profit_pct      Decimal     @default(10.0)
   max_risk_per_trade   Decimal     @default(5.0)
+  // Advanced risk management
+  trailing_stop_pct    Decimal     @default(2.0)
+  max_open_positions   Int         @default(5)
+  use_kelly            Boolean     @default(true)
+  kelly_fraction       Decimal     @default(0.5)
+  regime_filter        Boolean     @default(true)
+  use_sentiment        Boolean     @default(false)
   created_at           DateTime    @default(now())
   updated_at           DateTime    @updatedAt
   signals              signal[]
@@ -62,6 +69,13 @@ model signal {
   recommendation        String
   recommended_quantity  Int           @default(1)
   telegram_message_id   Int?
+  // Multi-timeframe & extra indicators
+  atr                   Decimal?      @db.Decimal(10, 4)
+  bb_upper              Decimal?      @db.Decimal(12, 4)
+  bb_lower              Decimal?      @db.Decimal(12, 4)
+  sentiment_score       Decimal?      @db.Decimal(5, 2)
+  regime_bullish        Boolean?
+  tf_alignment          String?
   created_at            DateTime      @default(now())
   orders                order[]
   performances          performance[]
@@ -102,30 +116,67 @@ model order {
 }
 
 model performance {
-  id               String            @id @default(cuid())
-  configuration_id String
-  configuration    configuration     @relation(fields: [configuration_id], references: [id], onDelete: Cascade)
-  buy_order_id     String
-  buy_order        order             @relation(fields: [buy_order_id], references: [id], onDelete: Cascade)
-  sell_order_id    String?
-  signal_id        String?
-  signal           signal?           @relation(fields: [signal_id], references: [id], onDelete: SetNull)
-  symbol           String            @db.VarChar(10)
-  entry_price      Decimal           @db.Decimal(12, 4)
-  entry_time       DateTime
-  exit_price       Decimal?          @db.Decimal(12, 4)
-  exit_time        DateTime?
-  quantity         Decimal           @db.Decimal(10, 2)
-  profit_loss      Decimal?          @db.Decimal(12, 4)
-  profit_loss_pct  Decimal?          @db.Decimal(8, 4)
-  duration_seconds Int?
-  status           PerformanceStatus @default(OPEN)
-  created_at       DateTime          @default(now())
-  updated_at       DateTime          @updatedAt
+  id                   String            @id @default(cuid())
+  configuration_id     String
+  configuration        configuration     @relation(fields: [configuration_id], references: [id], onDelete: Cascade)
+  buy_order_id         String
+  buy_order            order             @relation(fields: [buy_order_id], references: [id], onDelete: Cascade)
+  sell_order_id        String?
+  signal_id            String?
+  signal               signal?           @relation(fields: [signal_id], references: [id], onDelete: SetNull)
+  symbol               String            @db.VarChar(10)
+  entry_price          Decimal           @db.Decimal(12, 4)
+  entry_time           DateTime
+  exit_price           Decimal?          @db.Decimal(12, 4)
+  exit_time            DateTime?
+  quantity             Decimal           @db.Decimal(10, 2)
+  profit_loss          Decimal?          @db.Decimal(12, 4)
+  profit_loss_pct      Decimal?          @db.Decimal(8, 4)
+  duration_seconds     Int?
+  status               PerformanceStatus @default(OPEN)
+  // Trailing stop tracking
+  highest_price        Decimal?          @db.Decimal(12, 4)
+  trailing_stop_price  Decimal?          @db.Decimal(12, 4)
+  created_at           DateTime          @default(now())
+  updated_at           DateTime          @updatedAt
 
   @@index([symbol])
   @@index([status])
   @@index([entry_time])
+}
+
+model backtest {
+  id              String           @id @default(cuid())
+  symbol          String
+  start_date      DateTime
+  end_date        DateTime
+  timeframe       String           @default("1Day")
+  strategy_params Json
+  total_trades    Int              @default(0)
+  win_rate        Decimal?         @db.Decimal(5, 2)
+  total_pl        Decimal?         @db.Decimal(12, 4)
+  max_drawdown    Decimal?         @db.Decimal(8, 4)
+  sharpe_ratio    Decimal?         @db.Decimal(8, 4)
+  created_at      DateTime         @default(now())
+  trades          backtest_trade[]
+
+  @@index([symbol])
+  @@index([created_at])
+}
+
+model backtest_trade {
+  id          String    @id @default(cuid())
+  backtest_id String
+  backtest    backtest  @relation(fields: [backtest_id], references: [id], onDelete: Cascade)
+  symbol      String
+  entry_date  DateTime
+  exit_date   DateTime
+  entry_price Decimal   @db.Decimal(12, 4)
+  exit_price  Decimal   @db.Decimal(12, 4)
+  quantity    Int
+  pl          Decimal   @db.Decimal(12, 4)
+  pl_pct      Decimal   @db.Decimal(8, 4)
+  exit_reason String
 }
 
 enum SignalType {
