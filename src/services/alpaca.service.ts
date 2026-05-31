@@ -157,6 +157,65 @@ export class AlpacaService {
     }
   }
 
+  // Real open positions held at the broker (source of truth, with unrealized P&L)
+  async getPositions(): Promise<any[]> {
+    if (!this.alpaca) return [];
+    try {
+      return await this.alpaca.getPositions();
+    } catch (error) {
+      this.logger.error(`getPositions: ${error.message}`);
+      return [];
+    }
+  }
+
+  // A single real order by Alpaca id — used to read filled_avg_price / filled_qty after execution
+  async getOrder(alpacaOrderId: string): Promise<any | null> {
+    if (!this.alpaca) return null;
+    try {
+      return await this.alpaca.getOrder(alpacaOrderId);
+    } catch (error) {
+      this.logger.error(`getOrder(${alpacaOrderId}): ${error.message}`);
+      return null;
+    }
+  }
+
+  // Real portfolio equity curve from the broker (replaces the DB-derived fake curve)
+  async getPortfolioHistory(period = '3M', timeframe = '1D'): Promise<any | null> {
+    if (!this.alpaca) return null;
+    try {
+      return await this.alpaca.getPortfolioHistory({ period, timeframe, extended_hours: false });
+    } catch (error) {
+      this.logger.error(`getPortfolioHistory: ${error.message}`);
+      return null;
+    }
+  }
+
+  // All real FILL activities (actual executions), paginated ascending by time.
+  // This is the ground truth for what the bot really traded.
+  async getAllFillActivities(): Promise<any[]> {
+    if (!this.alpaca) return [];
+    const fills: any[] = [];
+    let pageToken: string | undefined;
+    try {
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const page: any[] = await this.alpaca.getAccountActivities({
+          activityTypes: 'FILL',
+          direction: 'asc',
+          pageSize: 100,
+          pageToken,
+        });
+        if (!page || page.length === 0) break;
+        fills.push(...page);
+        if (page.length < 100) break;
+        pageToken = page[page.length - 1].id;
+      }
+    } catch (error) {
+      this.logger.error(`getAllFillActivities: ${error.message}`);
+    }
+    return fills;
+  }
+
   async isMarketOpen(): Promise<boolean> {
     if (!this.alpaca) return false;
     try {

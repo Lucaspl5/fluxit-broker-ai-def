@@ -12,41 +12,57 @@ export class DashboardController {
 
   @Get('data')
   async getData() {
-    const [signals, orders, performances, account, configs] = await Promise.all([
+    const [signals, orders, closedCount, account, configs, brokerPositions, portfolioHistory] = await Promise.all([
       this.prisma.signal.findMany({ orderBy: { timestamp: 'desc' }, take: 20 }),
       this.prisma.order.findMany({ orderBy: { timestamp: 'desc' }, take: 20 }),
-      this.prisma.performance.findMany({ orderBy: { entry_time: 'desc' }, take: 50 }),
+      this.prisma.performance.count({ where: { status: 'CLOSED' } }),
       this.alpaca.getAccount(),
       this.prisma.configuration.findMany({ where: { enabled: true } }),
+      this.alpaca.getPositions(),
+      this.alpaca.getPortfolioHistory('3M', '1D'),
     ]);
 
-    const closed  = performances.filter(p => p.status === 'CLOSED');
-    const open    = performances.filter(p => p.status === 'OPEN');
-    const totalPL = closed.reduce((s, p) => s + Number(p.profit_loss ?? 0), 0);
-    const wins    = closed.filter(p => Number(p.profit_loss ?? 0) > 0).length;
-    const winRate = closed.length > 0 ? (wins / closed.length) * 100 : 0;
+    const INITIAL_CAPITAL = Number(process.env.INITIAL_CAPITAL ?? 100000);
+    const equity = account ? Number(account.equity ?? 0) : null;
 
-    // Equity curve: cumulative P&L sorted by exit_time
-    const equityCurve = closed
-      .filter(p => p.exit_time)
-      .sort((a, b) => new Date(a.exit_time!).getTime() - new Date(b.exit_time!).getTime())
-      .reduce<{ date: string; equity: number }[]>((acc, p) => {
-        const prev  = acc.at(-1)?.equity ?? 0;
-        acc.push({ date: new Date(p.exit_time!).toLocaleDateString('es-ES'), equity: parseFloat((prev + Number(p.profit_loss ?? 0)).toFixed(2)) });
-        return acc;
-      }, []);
+    // === Source of truth = Alpaca, not the DB ===
+    // Unrealized P&L = sum of open positions' unrealized_pl from the broker
+    const unrealizedPL = (brokerPositions ?? []).reduce((s: number, p: any) => s + Number(p.unrealized_pl ?? 0), 0);
+    // Total P&L since inception = current equity vs the capital we started with
+    const totalPL = equity != null ? equity - INITIAL_CAPITAL : 0;
+    const realizedPL = totalPL - unrealizedPL;
+
+    // Real equity curve from Alpaca portfolio history
+    const equityCurve = (() => {
+      if (!portfolioHistory?.timestamp?.length) return [] as { date: string; equity: number }[];
+      const ts: number[] = portfolioHistory.timestamp;
+      const eq: number[] = portfolioHistory.equity;
+      return ts
+        .map((t, i) => ({ date: new Date(t * 1000).toLocaleDateString('es-ES'), equity: parseFloat(Number(eq[i] ?? 0).toFixed(2)) }))
+        .filter(p => p.equity > 0);
+    })();
 
     return {
       summary: {
-        totalTrades: closed.length,
-        openTrades: open.length,
-        winRate: parseFloat(winRate.toFixed(2)),
+        closedTrades: closedCount,
+        openTrades: (brokerPositions ?? []).length,
         totalPL: parseFloat(totalPL.toFixed(2)),
-        equity: account ? parseFloat(Number(account.equity ?? 0).toFixed(2)) : null,
+        realizedPL: parseFloat(realizedPL.toFixed(2)),
+        unrealizedPL: parseFloat(unrealizedPL.toFixed(2)),
+        equity: equity != null ? parseFloat(equity.toFixed(2)) : null,
+        initialCapital: INITIAL_CAPITAL,
         buyingPower: account ? parseFloat(Number(account.buying_power ?? 0).toFixed(2)) : null,
         monitoredSymbols: configs.length,
       },
       equityCurve,
+      brokerPositions: (brokerPositions ?? []).map((p: any) => ({
+        symbol: p.symbol,
+        qty: Number(p.qty),
+        avgEntry: parseFloat(Number(p.avg_entry_price).toFixed(2)),
+        currentPrice: parseFloat(Number(p.current_price ?? 0).toFixed(2)),
+        unrealizedPL: parseFloat(Number(p.unrealized_pl ?? 0).toFixed(2)),
+        marketValue: parseFloat(Number(p.market_value ?? 0).toFixed(2)),
+      })),
       recentSignals: signals.map(s => ({
         id: s.id,
         symbol: s.symbol,
@@ -66,15 +82,6 @@ export class DashboardController {
         price: Number(o.price),
         status: o.status,
         timestamp: o.timestamp,
-      })),
-      openPositions: open.map(p => ({
-        id: p.id,
-        symbol: p.symbol,
-        entryPrice: Number(p.entry_price),
-        qty: Number(p.quantity),
-        entryTime: p.entry_time,
-        trailingStop: p.trailing_stop_price ? Number(p.trailing_stop_price) : null,
-        highestPrice: p.highest_price ? Number(p.highest_price) : null,
       })),
     };
   }
@@ -134,10 +141,10 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 </header>
 
 <div class="grid" id="summary-cards">
-  <div class="card"><div class="label">Equity</div><div class="value blue" id="equity">—</div></div>
-  <div class="card"><div class="label">P&L Total</div><div class="value" id="total-pl">—</div></div>
-  <div class="card"><div class="label">Win Rate</div><div class="value" id="win-rate">—</div></div>
-  <div class="card"><div class="label">Trades</div><div class="value blue" id="total-trades">—</div></div>
+  <div class="card"><div class="label">Equity (Alpaca)</div><div class="value blue" id="equity">—</div></div>
+  <div class="card"><div class="label">P&L Total (real)</div><div class="value" id="total-pl">—</div></div>
+  <div class="card"><div class="label">P&L No Realizado</div><div class="value" id="unrealized-pl">—</div></div>
+  <div class="card"><div class="label">Trades Cerrados</div><div class="value blue" id="total-trades">—</div></div>
   <div class="card"><div class="label">Posiciones</div><div class="value blue" id="open-trades">—</div></div>
   <div class="card"><div class="label">Símbolos</div><div class="value blue" id="symbols">—</div></div>
 </div>
@@ -174,7 +181,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   <h2>Posiciones abiertas</h2>
   <div class="tbl-wrap">
     <table>
-      <thead><tr><th>Símbolo</th><th>Qty</th><th>Entrada</th><th>Trailing Stop</th><th>Máximo</th><th>Desde</th></tr></thead>
+      <thead><tr><th>Símbolo</th><th>Qty</th><th>Entrada Media</th><th>Precio Actual</th><th>P&L No Real.</th><th>Valor Mercado</th></tr></thead>
       <tbody id="positions-table"><tr><td colspan="6" style="text-align:center;color:#64748b">Cargando...</td></tr></tbody>
     </table>
   </div>
@@ -187,14 +194,15 @@ async function loadData() {
   const r = await fetch('/dashboard/data');
   const d = await r.json();
 
-  // Summary
-  const pl = d.summary.totalPL;
+  // Summary — all money figures come from Alpaca (source of truth)
+  const pl  = d.summary.totalPL;
+  const upl = d.summary.unrealizedPL;
   document.getElementById('equity').textContent    = d.summary.equity != null ? '$' + d.summary.equity.toLocaleString() : '—';
   document.getElementById('total-pl').textContent  = (pl >= 0 ? '+' : '') + '$' + pl.toFixed(2);
   document.getElementById('total-pl').className    = 'value ' + (pl >= 0 ? 'green' : 'red');
-  document.getElementById('win-rate').textContent  = d.summary.winRate.toFixed(1) + '%';
-  document.getElementById('win-rate').className    = 'value ' + (d.summary.winRate >= 50 ? 'green' : 'red');
-  document.getElementById('total-trades').textContent = d.summary.totalTrades;
+  document.getElementById('unrealized-pl').textContent = (upl >= 0 ? '+' : '') + '$' + upl.toFixed(2);
+  document.getElementById('unrealized-pl').className   = 'value ' + (upl >= 0 ? 'green' : 'red');
+  document.getElementById('total-trades').textContent = d.summary.closedTrades;
   document.getElementById('open-trades').textContent  = d.summary.openTrades;
   document.getElementById('symbols').textContent       = d.summary.monitoredSymbols;
 
@@ -208,7 +216,7 @@ async function loadData() {
       type: 'line',
       data: {
         labels,
-        datasets: [{ label: 'P&L Acumulado ($)', data: values, borderColor: '#60a5fa', backgroundColor: 'rgba(96,165,250,0.08)', tension: 0.3, pointRadius: 3 }]
+        datasets: [{ label: 'Equity Alpaca ($)', data: values, borderColor: '#60a5fa', backgroundColor: 'rgba(96,165,250,0.08)', tension: 0.3, pointRadius: 3 }]
       },
       options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { color: '#94a3b8' } } }, scales: { x: { ticks: { color: '#64748b' }, grid: { color: '#1e293b' } }, y: { ticks: { color: '#64748b' }, grid: { color: '#334155' } } } }
     });
@@ -239,16 +247,15 @@ async function loadData() {
     }).join('');
   }
 
-  // Positions
+  // Positions — real open positions from Alpaca with live unrealized P&L
   const posBody = document.getElementById('positions-table');
-  if (d.openPositions.length === 0) {
+  if (!d.brokerPositions || d.brokerPositions.length === 0) {
     posBody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#64748b">No hay posiciones abiertas</td></tr>';
   } else {
-    posBody.innerHTML = d.openPositions.map(p => {
-      const since = new Date(p.entryTime).toLocaleString('es-ES', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-      const ts    = p.trailingStop != null ? '$' + p.trailingStop.toFixed(2) : '—';
-      const high  = p.highestPrice != null ? '$' + p.highestPrice.toFixed(2) : '—';
-      return \`<tr><td><b>\${p.symbol}</b></td><td>\${p.qty}</td><td>$\${p.entryPrice.toFixed(2)}</td><td>\${ts}</td><td>\${high}</td><td>\${since}</td></tr>\`;
+    posBody.innerHTML = d.brokerPositions.map(p => {
+      const cls  = p.unrealizedPL >= 0 ? 'buy' : 'sell';
+      const upl  = (p.unrealizedPL >= 0 ? '+' : '') + '$' + p.unrealizedPL.toFixed(2);
+      return \`<tr><td><b>\${p.symbol}</b></td><td>\${p.qty}</td><td>$\${p.avgEntry.toFixed(2)}</td><td>$\${p.currentPrice.toFixed(2)}</td><td><span class="pill \${cls}">\${upl}</span></td><td>$\${p.marketValue.toFixed(2)}</td></tr>\`;
     }).join('');
   }
 }

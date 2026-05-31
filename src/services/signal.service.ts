@@ -132,25 +132,68 @@ export class SignalService implements OnApplicationBootstrap {
         continue;
       }
 
-      const reason   = hitSL ? (currentTrailSL > sl ? 'Trailing Stop' : 'Stop Loss') : 'Take Profit';
-      const exitTime = new Date();
-      let totalPL    = 0;
+      const reason = hitSL ? (currentTrailSL > sl ? 'Trailing Stop' : 'Stop Loss') : 'Take Profit';
 
-      this.logger.log(`${symbol}: ${reason} triggered at $${currentPrice} — closing ${positions.length} position(s)`);
+      this.logger.log(`${symbol}: ${reason} triggered at $${currentPrice} — attempting to close ${positions.length} position(s)`);
 
+      // Execute the SELL on Alpaca FIRST. Only book the close (and P&L) if it actually fills.
+      // Booking before confirming the fill was the root cause of phantom realized P&L.
+      const totalQty   = positions.reduce((s, p) => s + Number(p.quantity), 0);
+      const sellResult = await this.alpaca.executeOrderWithStatus({ symbol, qty: totalQty, side: 'sell', type: 'market' });
+
+      if (sellResult.status !== 'filled' || !sellResult.order) {
+        this.logger.warn(`${symbol}: ${reason} hit but SELL not filled (status=${sellResult.status}) — position left OPEN`);
+        await this.prisma.order.create({
+          data: {
+            configuration_id: ref.configuration_id,
+            symbol,
+            order_type: 'SELL',
+            quantity: new Decimal(totalQty),
+            price: new Decimal(currentPrice),
+            max_risk_eur: ref.buy_order.max_risk_eur,
+            status: sellResult.status === 'failed' ? 'FAILED' : 'PENDING',
+            alpaca_order_id: sellResult.order?.id,
+            status_reason: `${reason} — ${sellResult.status}`,
+            notes: `Auto-close attempt (${reason}) not filled`,
+          },
+        });
+        continue;
+      }
+
+      // Real fill price/time from Alpaca
+      const exitPrice = Number(sellResult.order.filled_avg_price) || currentPrice;
+      const exitTime  = sellResult.order.filled_at ? new Date(sellResult.order.filled_at) : new Date();
+
+      const sellOrder = await this.prisma.order.create({
+        data: {
+          configuration_id: ref.configuration_id,
+          symbol,
+          order_type: 'SELL',
+          quantity: new Decimal(totalQty),
+          price: new Decimal(exitPrice),
+          max_risk_eur: ref.buy_order.max_risk_eur,
+          status: 'EXECUTED',
+          alpaca_order_id: sellResult.order.id,
+          execution_time: exitTime,
+          notes: `Auto-closed by ${reason} (${positions.length} position(s))`,
+        },
+      });
+
+      let totalPL = 0;
       for (const pos of positions) {
         const entry    = Number(pos.entry_price);
         const qty      = Number(pos.quantity);
-        const pl       = (currentPrice - entry) * qty;
-        const plPct    = ((currentPrice - entry) / entry) * 100;
+        const pl       = (exitPrice - entry) * qty;
+        const plPct    = ((exitPrice - entry) / entry) * 100;
         const duration = Math.floor((exitTime.getTime() - new Date(pos.entry_time).getTime()) / 1000);
         totalPL += pl;
 
         await this.prisma.performance.update({
           where: { id: pos.id },
           data: {
-            exit_price: new Decimal(currentPrice),
+            exit_price: new Decimal(exitPrice),
             exit_time: exitTime,
+            sell_order_id: sellOrder.id,
             profit_loss: new Decimal(pl),
             profit_loss_pct: new Decimal(plPct),
             duration_seconds: duration,
@@ -159,26 +202,8 @@ export class SignalService implements OnApplicationBootstrap {
         });
       }
 
-      const totalQty   = positions.reduce((s, p) => s + Number(p.quantity), 0);
-      const alpacaOrder = await this.alpaca.executeOrder({ symbol, qty: totalQty, side: 'sell', type: 'market' });
-
-      await this.prisma.order.create({
-        data: {
-          configuration_id: ref.configuration_id,
-          symbol,
-          order_type: 'SELL',
-          quantity: totalQty,
-          price: new Decimal(currentPrice),
-          max_risk_eur: ref.buy_order.max_risk_eur,
-          status: alpacaOrder ? 'EXECUTED' : 'CANCELLED',
-          alpaca_order_id: alpacaOrder?.id,
-          execution_time: exitTime,
-          notes: `Auto-closed by ${reason} (${positions.length} position(s))`,
-        },
-      });
-
-      const totalPlPct = ((currentPrice - Number(ref.entry_price)) / Number(ref.entry_price)) * 100;
-      await this.telegram.sendAutoClose(symbol, reason, currentPrice, totalPL, totalPlPct);
+      const totalPlPct = ((exitPrice - Number(ref.entry_price)) / Number(ref.entry_price)) * 100;
+      await this.telegram.sendAutoClose(symbol, reason, exitPrice, totalPL, totalPlPct);
       this.logger.log(`${symbol} auto-closed (${reason}): total P&L=${totalPL >= 0 ? '+' : ''}$${totalPL.toFixed(2)}`);
     }
   }

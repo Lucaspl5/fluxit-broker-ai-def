@@ -103,33 +103,50 @@ export class OrderService implements OnApplicationBootstrap {
     const order = await this.prisma.order.findUnique({ where: { id: orderId } });
     if (!order || order.status !== 'PENDING') return false;
 
-    const alpacaOrder = await this.alpaca.executeOrder({
+    const result = await this.alpaca.executeOrderWithStatus({
       symbol: order.symbol,
       qty: order.quantity.toNumber(),
       side: order.order_type.toLowerCase() as 'buy' | 'sell',
       type: 'market',
     });
 
-    if (!alpacaOrder) {
-      await this.prisma.order.update({ where: { id: orderId }, data: { status: 'FAILED' } });
+    // Only an actual FILL counts. market_closed / pending_open / failed must NOT
+    // book a position or P&L — doing so was the root cause of phantom profits.
+    if (result.status !== 'filled' || !result.order) {
+      const newStatus =
+        result.status === 'market_closed' || result.status === 'pending_open' ? 'PENDING' : 'FAILED';
+      await this.prisma.order.update({
+        where: { id: orderId },
+        data: {
+          status: newStatus,
+          alpaca_order_id: result.order?.id,
+          status_reason: result.status + (result.errorMessage ? `: ${result.errorMessage}` : ''),
+        },
+      });
+      this.logger.warn(`Order ${orderId} not filled (status=${result.status}) — no position booked`);
       return false;
     }
+
+    // Read the REAL fill price and quantity from Alpaca (fall back to a re-fetch)
+    const fill = await this.resolveFill(result.order, order.price.toNumber(), order.quantity.toNumber());
 
     const updated = await this.prisma.order.update({
       where: { id: orderId },
       data: {
         status: 'EXECUTED',
-        alpaca_order_id: alpacaOrder.id,
+        price: new Decimal(fill.price),
+        quantity: new Decimal(fill.qty),
+        alpaca_order_id: result.order.id,
         user_authorization_time: new Date(),
-        execution_time: new Date(),
+        execution_time: fill.time,
       },
     });
 
     await this.telegram.sendOrderConfirmation(
       order.symbol,
       order.order_type,
-      order.quantity.toFixed(2),
-      order.price.toFixed(2),
+      fill.qty.toFixed(2),
+      fill.price.toFixed(2),
     );
 
     if (order.order_type === 'BUY') {
@@ -139,17 +156,43 @@ export class OrderService implements OnApplicationBootstrap {
           buy_order_id: order.id,
           signal_id: order.signal_id || undefined,
           symbol: order.symbol,
-          entry_price: order.price,
-          entry_time: updated.execution_time || new Date(),
-          quantity: order.quantity,
+          entry_price: new Decimal(fill.price),
+          entry_time: updated.execution_time || fill.time,
+          quantity: new Decimal(fill.qty),
           status: 'OPEN',
         },
       });
     } else if (order.order_type === 'SELL') {
-      await this.closeOpenPosition(order.symbol, order.price.toNumber(), new Date());
+      await this.closeOpenPosition(order.symbol, fill.price, fill.time);
     }
 
     return true;
+  }
+
+  // Extracts the real filled price/qty from an Alpaca order, re-fetching if needed
+  private async resolveFill(
+    alpacaOrder: any,
+    fallbackPrice: number,
+    fallbackQty: number,
+  ): Promise<{ price: number; qty: number; time: Date }> {
+    let avg = Number(alpacaOrder.filled_avg_price ?? 0);
+    let qty = Number(alpacaOrder.filled_qty ?? 0);
+    let filledAt = alpacaOrder.filled_at;
+
+    if (!avg || !qty) {
+      const fresh = await this.alpaca.getOrder(alpacaOrder.id);
+      if (fresh) {
+        avg = Number(fresh.filled_avg_price ?? avg);
+        qty = Number(fresh.filled_qty ?? qty);
+        filledAt = fresh.filled_at ?? filledAt;
+      }
+    }
+
+    return {
+      price: avg > 0 ? avg : fallbackPrice,
+      qty: qty > 0 ? qty : fallbackQty,
+      time: filledAt ? new Date(filledAt) : new Date(),
+    };
   }
 
   async closeOpenPosition(symbol: string, exitPrice: number, exitTime: Date): Promise<void> {

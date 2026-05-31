@@ -11,6 +11,7 @@ import { SignalService } from './services/signal.service';
 import { OrderService } from './services/order.service';
 import { SentimentService } from './services/sentiment.service';
 import { BacktestingService } from './services/backtesting.service';
+import { ReconciliationService } from './services/reconciliation.service';
 
 import { AppController } from './app.controller';
 import { AnalysisController } from './controllers/analysis.controller';
@@ -21,6 +22,7 @@ import { PerformanceController } from './controllers/performance.controller';
 import { ConfigController } from './controllers/config.controller';
 import { BacktestingController } from './controllers/backtesting.controller';
 import { DashboardController } from './controllers/dashboard.controller';
+import { ReconciliationController } from './controllers/reconciliation.controller';
 
 @Module({
   imports: [
@@ -37,6 +39,7 @@ import { DashboardController } from './controllers/dashboard.controller';
     ConfigController,
     BacktestingController,
     DashboardController,
+    ReconciliationController,
   ],
   providers: [
     PrismaService,
@@ -48,6 +51,7 @@ import { DashboardController } from './controllers/dashboard.controller';
     OrderService,
     SentimentService,
     BacktestingService,
+    ReconciliationService,
   ],
 })
 export class AppModule {}
