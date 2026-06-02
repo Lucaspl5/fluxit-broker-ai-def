@@ -418,35 +418,55 @@ export class TelegramService implements OnModuleInit {
       { chat_id: chat, message_id: msgId, parse_mode: 'HTML' },
     );
 
-    const alpacaOrder = await this.alpaca.executeOrder({
+    const result = await this.alpaca.executeOrderWithStatus({
       symbol: perf.symbol,
       qty: Number(perf.quantity),
       side: 'sell',
       type: 'market',
     });
 
-    const latestPrice = await this.alpaca.getLatestPrice(perf.symbol);
-    const exitPrice = latestPrice ?? Number(perf.entry_price);
+    // Not actually filled → leave the position OPEN and just record the attempt.
+    // Booking a close at a fake price (the old behaviour) corrupted P&L.
+    if (result.status !== 'filled' || !result.order) {
+      const pending = result.status === 'market_closed' || result.status === 'pending_open';
+      await this.prisma.order.create({
+        data: {
+          configuration_id: perf.configuration_id,
+          symbol: perf.symbol,
+          order_type: 'SELL',
+          quantity: perf.quantity,
+          price: perf.entry_price,
+          max_risk_eur: perf.buy_order.max_risk_eur,
+          status: pending ? 'PENDING' : 'FAILED',
+          alpaca_order_id: result.order?.id ?? null,
+          status_reason: result.status + (result.errorMessage ? `: ${result.errorMessage}` : ''),
+          notes: 'Manual close attempt (not filled) — position left OPEN',
+        },
+      });
+      const { text: posText, keyboard: posKb } = await this.buildPositionsView();
+      const note =
+        result.status === 'market_closed'
+          ? `⚠️ <b>Mercado cerrado.</b> ${perf.symbol} sigue abierta; vuelve a cerrarla en la apertura.`
+          : result.status === 'pending_open'
+          ? `⏳ Orden de cierre enviada pero sin confirmar. ${perf.symbol} sigue abierta de momento.`
+          : `❌ Alpaca rechazó el cierre de ${perf.symbol}: ${result.errorMessage ?? 'error'}. Sigue abierta.`;
+      await this.bot.editMessageText(`${note}\n\n` + posText, {
+        chat_id: chat, message_id: msgId, parse_mode: 'HTML', reply_markup: posKb,
+      });
+      this.logger.warn(`Manual close not filled: ${perf.symbol} status=${result.status}`);
+      return;
+    }
+
+    // === REAL FILL ===
+    const exitPrice = Number(result.order.filled_avg_price) || Number(perf.entry_price);
+    const exitTime  = result.order.filled_at ? new Date(result.order.filled_at) : new Date();
     const entry     = Number(perf.entry_price);
     const qty       = Number(perf.quantity);
     const pl        = (exitPrice - entry) * qty;
     const plPct     = ((exitPrice - entry) / entry) * 100;
-    const exitTime  = new Date();
     const duration  = Math.floor((exitTime.getTime() - new Date(perf.entry_time).getTime()) / 1000);
 
-    await this.prisma.performance.update({
-      where: { id: perfId },
-      data: {
-        exit_price: exitPrice,
-        exit_time: exitTime,
-        profit_loss: pl,
-        profit_loss_pct: plPct,
-        duration_seconds: duration,
-        status: 'CLOSED',
-      },
-    });
-
-    await this.prisma.order.create({
+    const sellOrder = await this.prisma.order.create({
       data: {
         configuration_id: perf.configuration_id,
         symbol: perf.symbol,
@@ -454,24 +474,34 @@ export class TelegramService implements OnModuleInit {
         quantity: perf.quantity,
         price: exitPrice,
         max_risk_eur: perf.buy_order.max_risk_eur,
-        status: alpacaOrder ? 'EXECUTED' : 'CANCELLED',
-        alpaca_order_id: alpacaOrder?.id,
+        status: 'EXECUTED',
+        alpaca_order_id: result.order.id,
         execution_time: exitTime,
-        notes: alpacaOrder
-          ? 'Closed manually via Telegram dashboard'
-          : 'Closed manually (market closed — Alpaca order pending)',
+        notes: 'Closed manually via Telegram dashboard',
+      },
+    });
+
+    await this.prisma.performance.update({
+      where: { id: perfId },
+      data: {
+        exit_price: exitPrice,
+        exit_time: exitTime,
+        sell_order_id: sellOrder.id,
+        profit_loss: pl,
+        profit_loss_pct: plPct,
+        duration_seconds: duration,
+        status: 'CLOSED',
       },
     });
 
     const plEmoji = pl >= 0 ? '✅' : '❌';
-    const alpacaNote = alpacaOrder ? '' : '\n⚠️ <i>Mercado cerrado: posición cerrada en el sistema. La orden en Alpaca se ejecutará en la apertura.</i>';
     const { text, keyboard } = await this.buildPositionsView();
     await this.bot.editMessageText(
-      `${plEmoji} <b>${perf.symbol} cerrada</b>  P&L: ${pl >= 0 ? '+' : ''}$${pl.toFixed(2)} (${plPct >= 0 ? '+' : ''}${plPct.toFixed(2)}%)${alpacaNote}\n\n` + text,
+      `${plEmoji} <b>${perf.symbol} cerrada</b>  $${exitPrice.toFixed(2)}  P&L: ${pl >= 0 ? '+' : ''}$${pl.toFixed(2)} (${plPct >= 0 ? '+' : ''}${plPct.toFixed(2)}%)\n\n` + text,
       { chat_id: chat, message_id: msgId, parse_mode: 'HTML', reply_markup: keyboard },
     );
 
-    this.logger.log(`Position manually closed: ${perf.symbol} P&L=${pl >= 0 ? '+' : ''}$${pl.toFixed(2)}`);
+    this.logger.log(`Position manually closed: ${perf.symbol} @ $${exitPrice.toFixed(2)} P&L=${pl >= 0 ? '+' : ''}$${pl.toFixed(2)}`);
   }
 
   private async handleOrderCallback(
@@ -552,21 +582,83 @@ export class TelegramService implements OnModuleInit {
         orderQty = sellOpenPerf ? Number(sellOpenPerf.quantity) : 1;
       }
 
+      const riskLevel = cfg.risk_profile === 'BAJO' ? 'LOW' : cfg.risk_profile === 'MEDIUM' ? 'MEDIUM' : 'HIGH';
+
+      // Tell the user we're working on it. NOTHING is booked until Alpaca confirms a real fill —
+      // booking before the fill (at the stale signal price) was the cause of phantom positions/P&L.
+      await this.bot.editMessageText(
+        `⏳ <b>${orderSide.toUpperCase()} ${signal.symbol}</b> — enviando a Alpaca...`,
+        { chat_id: chat, message_id: msgId, parse_mode: 'HTML' },
+      ).catch(() => {});
+      this.logger.log(`Telegram order submitted: signal=${signalId} side=${orderSide} symbol=${signal.symbol} qty=${orderQty}`);
+
+      let result;
+      try {
+        result = await this.alpaca.executeOrderWithStatus({ symbol: signal.symbol, qty: orderQty, side: orderSide, type: 'market' });
+      } catch (e) {
+        this.logger.error(`Alpaca order error: ${e.message}`);
+        await this.bot.editMessageText(
+          `❌ Error enviando la orden de <b>${signal.symbol}</b> a Alpaca. Inténtalo de nuevo.`,
+          { chat_id: chat, message_id: msgId, parse_mode: 'HTML', reply_markup: this.backKeyboard() },
+        ).catch(() => {});
+        return;
+      }
+
+      // Not filled → record the attempt but DO NOT open a position.
+      if (result.status !== 'filled' || !result.order) {
+        const pending = result.status === 'market_closed' || result.status === 'pending_open';
+        await this.prisma.order.create({
+          data: {
+            configuration_id: cfg.id,
+            signal_id: signalId,
+            symbol: signal.symbol,
+            order_type: orderSide.toUpperCase() as 'BUY' | 'SELL',
+            quantity: orderQty,
+            price,
+            max_risk_eur: cfg.max_risk_per_trade,
+            risk_level: riskLevel,
+            status: pending ? 'PENDING' : 'FAILED',
+            alpaca_order_id: result.order?.id ?? null,
+            status_reason: result.status + (result.errorMessage ? `: ${result.errorMessage}` : ''),
+            user_authorization_time: now,
+          },
+        });
+        const statusMsg =
+          result.status === 'market_closed'
+            ? `⚠️ <b>Mercado cerrado.</b> La orden de ${signal.symbol} quedó pendiente; vuelve a confirmarla en la apertura.`
+            : result.status === 'pending_open'
+            ? `⏳ Orden de ${signal.symbol} enviada pero sin confirmar el fill todavía. Revisa 📌 Posiciones en unos minutos.`
+            : `❌ Alpaca rechazó la orden de ${signal.symbol}: ${result.errorMessage ?? 'error desconocido'}`;
+        await this.bot.editMessageText(statusMsg, {
+          chat_id: chat, message_id: msgId, parse_mode: 'HTML', reply_markup: this.backKeyboard(),
+        }).catch(() => {});
+        this.logger.warn(`Telegram order not filled: ${signal.symbol} ${orderSide} status=${result.status}`);
+        return;
+      }
+
+      // === REAL FILL ===
+      const fillPrice = Number(result.order.filled_avg_price) || price;
+      const fillQty   = Number(result.order.filled_qty) || orderQty;
+      const fillTime  = result.order.filled_at ? new Date(result.order.filled_at) : new Date();
+      const slPrice   = fillPrice * slMul;
+      const tpPrice   = fillPrice * tpMul;
+
       const savedOrder = await this.prisma.order.create({
         data: {
           configuration_id: cfg.id,
           signal_id: signalId,
           symbol: signal.symbol,
           order_type: orderSide.toUpperCase() as 'BUY' | 'SELL',
-          quantity: orderQty,
-          price,
-          stop_loss_price: price * slMul,
-          take_profit_price: price * tpMul,
+          quantity: fillQty,
+          price: fillPrice,
+          stop_loss_price: slPrice,
+          take_profit_price: tpPrice,
           max_risk_eur: cfg.max_risk_per_trade,
-          risk_level: cfg.risk_profile === 'BAJO' ? 'LOW' : cfg.risk_profile === 'MEDIUM' ? 'MEDIUM' : 'HIGH',
+          risk_level: riskLevel,
           status: 'EXECUTED',
+          alpaca_order_id: result.order.id,
           user_authorization_time: now,
-          execution_time: now,
+          execution_time: fillTime,
         },
       });
 
@@ -577,67 +669,41 @@ export class TelegramService implements OnModuleInit {
             buy_order_id: savedOrder.id,
             signal_id: signalId,
             symbol: signal.symbol,
-            entry_price: price,
-            entry_time: now,
-            quantity: orderQty,
+            entry_price: fillPrice,
+            entry_time: fillTime,
+            quantity: fillQty,
             status: 'OPEN',
           },
         });
+        await this.bot.editMessageText(
+          `✅ <b>BUY ejecutada — ${signal.symbol}</b>\n` +
+          `💰 Precio real: $${fillPrice.toFixed(2)}\n` +
+          `📦 Cantidad: ${fillQty} acciones\n` +
+          `🛡️ SL $${slPrice.toFixed(2)}  🎯 TP $${tpPrice.toFixed(2)}`,
+          { chat_id: chat, message_id: msgId, parse_mode: 'HTML', reply_markup: this.backKeyboard() },
+        ).catch(() => {});
       } else if (sellOpenPerf) {
-        const entry = Number(sellOpenPerf.entry_price);
-        const qty = Number(sellOpenPerf.quantity);
-        const pl = (price - entry) * qty;
-        const plPct = ((price - entry) / entry) * 100;
-        const duration = Math.floor((now.getTime() - new Date(sellOpenPerf.entry_time).getTime()) / 1000);
+        const entry    = Number(sellOpenPerf.entry_price);
+        const qtyClose = Number(sellOpenPerf.quantity);
+        const pl       = (fillPrice - entry) * qtyClose;
+        const plPct    = ((fillPrice - entry) / entry) * 100;
+        const duration = Math.floor((fillTime.getTime() - new Date(sellOpenPerf.entry_time).getTime()) / 1000);
         await this.prisma.performance.update({
           where: { id: sellOpenPerf.id },
-          data: { exit_price: price, exit_time: now, profit_loss: pl, profit_loss_pct: plPct, duration_seconds: duration, status: 'CLOSED' },
+          data: {
+            exit_price: fillPrice, exit_time: fillTime, sell_order_id: savedOrder.id,
+            profit_loss: pl, profit_loss_pct: plPct, duration_seconds: duration, status: 'CLOSED',
+          },
         });
+        const e = pl >= 0 ? '✅' : '❌';
+        await this.bot.editMessageText(
+          `${e} <b>SELL ejecutada — ${signal.symbol}</b>\n` +
+          `💰 Precio real: $${fillPrice.toFixed(2)}\n` +
+          `P&L: ${pl >= 0 ? '+' : ''}$${pl.toFixed(2)} (${plPct >= 0 ? '+' : ''}${plPct.toFixed(2)}%)`,
+          { chat_id: chat, message_id: msgId, parse_mode: 'HTML', reply_markup: this.backKeyboard() },
+        ).catch(() => {});
       }
-
-      await this.bot.editMessageText(
-        `✅ <b>Orden ${orderSide === 'buy' ? 'BUY' : 'SELL'} registrada — ${signal.symbol} a $${price.toFixed(2)}</b>\n` +
-        `📦 Cantidad: ${orderQty} acciones\n⏳ Enviando a Alpaca...`,
-        { chat_id: chat, message_id: msgId, parse_mode: 'HTML', reply_markup: this.backKeyboard() },
-      );
-      this.logger.log(`Order registered: signal=${signalId} side=${orderSide} symbol=${signal.symbol} qty=${orderQty}`);
-
-      // Bug fix: use executeOrderWithStatus to correctly distinguish market_closed from actual failures
-      this.alpaca.executeOrderWithStatus({ symbol: signal.symbol, qty: orderQty, side: orderSide, type: 'market' })
-        .then(async (result) => {
-          let statusMsg: string;
-          let statusReason: string | undefined;
-
-          if (result.status === 'filled') {
-            statusMsg = '✅ Ejecutada en Alpaca';
-          } else if (result.status === 'pending_open') {
-            statusMsg = '⏳ Orden enviada — pendiente de ejecución en Alpaca';
-            statusReason = 'Pending Alpaca fill';
-          } else if (result.status === 'market_closed') {
-            statusMsg = '⚠️ Mercado cerrado — se ejecutará en la apertura';
-            statusReason = 'Market closed';
-          } else {
-            statusMsg = `❌ Error en Alpaca: ${result.errorMessage ?? 'unknown'}`;
-            statusReason = result.errorMessage ?? 'Failed';
-          }
-
-          await this.prisma.order.update({
-            where: { id: savedOrder.id },
-            data: {
-              alpaca_order_id: result.order?.id ?? null,
-              status_reason: statusReason,
-              status: result.order ? 'EXECUTED' : (result.status === 'failed' ? 'FAILED' : 'EXECUTED'),
-            },
-          });
-
-          if (this.chatId) {
-            await this.bot!.sendMessage(this.chatId,
-              `${statusMsg}: <b>${signal.symbol}</b> ${orderSide.toUpperCase()} $${price.toFixed(2)}`,
-              { parse_mode: 'HTML' },
-            );
-          }
-        })
-        .catch((e) => this.logger.error(`Alpaca order error: ${e.message}`));
+      this.logger.log(`Telegram order filled: ${signal.symbol} ${orderSide} qty=${fillQty} @ $${fillPrice.toFixed(2)}`);
 
     } else if (data.startsWith('cancel_')) {
       const signalId = data.replace('cancel_', '');

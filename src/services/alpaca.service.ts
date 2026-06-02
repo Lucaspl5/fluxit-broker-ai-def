@@ -103,13 +103,26 @@ export class AlpacaService {
       });
       this.logger.log(`Order placed: ${order.id} ${params.side} ${params.symbol} status=${order.status}`);
 
-      // Alpaca returns status: 'filled' (immediate) or 'accepted'/'pending_new' (market closed / queue)
-      const filled = order.status === 'filled' || order.status === 'partially_filled';
-      if (filled) return { order, status: 'filled' };
+      // Alpaca returns status: 'filled' (rare/immediate) or 'accepted'/'pending_new'.
+      // Both paper and live fill market orders ASYNCHRONOUSLY, so the initial response
+      // is almost always 'accepted' even during market hours — we must poll for the fill.
+      if (order.status === 'filled' || order.status === 'partially_filled') {
+        return { order, status: 'filled' };
+      }
 
-      // Distinguish market closed from other pending states
       const marketOpen = await this.isMarketOpen();
-      return { order, status: marketOpen ? 'pending_open' : 'market_closed' };
+      if (!marketOpen) return { order, status: 'market_closed' };
+
+      // Market is open but the order is still queued — wait briefly for the real fill.
+      const settled = await this.awaitFill(order.id);
+      if (settled) {
+        const s = String(settled.status);
+        if (s === 'filled' || s === 'partially_filled') return { order: settled, status: 'filled' };
+        if (s === 'canceled' || s === 'rejected' || s === 'expired') {
+          return { order: settled, status: 'failed', errorMessage: `Alpaca order ${s}` };
+        }
+      }
+      return { order: settled ?? order, status: 'pending_open' };
     } catch (error) {
       const msg: string = error.message ?? '';
       this.logger.error(`executeOrder(${params.symbol}): ${msg}`);
@@ -177,6 +190,24 @@ export class AlpacaService {
       this.logger.error(`getOrder(${alpacaOrderId}): ${error.message}`);
       return null;
     }
+  }
+
+  // Polls an order until it reaches a terminal state. Alpaca fills market orders
+  // asynchronously (the createOrder response is usually 'accepted'/'pending_new'),
+  // so this is required to read the real filled_avg_price before booking a position.
+  async awaitFill(orderId: string, timeoutMs = 8000): Promise<any | null> {
+    if (!this.alpaca) return null;
+    const deadline = Date.now() + timeoutMs;
+    let last: any = null;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 1000));
+      const o = await this.getOrder(orderId);
+      if (!o) continue;
+      last = o;
+      const s = String(o.status);
+      if (s === 'filled' || s === 'canceled' || s === 'rejected' || s === 'expired') return o;
+    }
+    return last;
   }
 
   // Real portfolio equity curve from the broker (replaces the DB-derived fake curve)
