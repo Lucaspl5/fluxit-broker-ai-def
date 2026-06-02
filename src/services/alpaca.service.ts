@@ -160,6 +160,32 @@ export class AlpacaService {
     }
   }
 
+  // Cancels every open order at the broker (used by flatten/reset).
+  async cancelAllOrders(): Promise<boolean> {
+    if (!this.alpaca) return false;
+    try {
+      await this.alpaca.cancelAllOrders();
+      this.logger.log('Cancelled all open orders');
+      return true;
+    } catch (error) {
+      this.logger.error(`cancelAllOrders: ${error.message}`);
+      return false;
+    }
+  }
+
+  // Closes EVERY open position (longs and shorts) at market. Returns the broker responses.
+  async closeAllPositions(): Promise<any[]> {
+    if (!this.alpaca) return [];
+    try {
+      const res = await this.alpaca.closeAllPositions();
+      this.logger.log(`closeAllPositions requested (${Array.isArray(res) ? res.length : '?'} positions)`);
+      return Array.isArray(res) ? res : [];
+    } catch (error) {
+      this.logger.error(`closeAllPositions: ${error.message}`);
+      return [];
+    }
+  }
+
   async getAccount(): Promise<any | null> {
     if (!this.alpaca) return null;
     try {

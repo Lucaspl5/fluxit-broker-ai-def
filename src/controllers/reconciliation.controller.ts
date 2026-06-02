@@ -30,4 +30,12 @@ export class ReconciliationController {
     this.assertToken(token);
     return this.reconciliation.reconcile(false);
   }
+
+  @Post('flatten-reset')
+  @ApiOperation({ summary: 'FLATTEN broker (close all positions) + WIPE orders/performance/signals for a clean slate' })
+  @ApiQuery({ name: 'token', required: true })
+  async flattenReset(@Query('token') token?: string) {
+    this.assertToken(token);
+    return this.reconciliation.flattenAndReset();
+  }
 }

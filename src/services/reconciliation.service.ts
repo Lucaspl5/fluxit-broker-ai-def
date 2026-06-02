@@ -66,6 +66,47 @@ export class ReconciliationService {
   ) {}
 
   /**
+   * Flattens the broker account (cancels open orders + closes ALL positions, longs and
+   * shorts) and wipes the local bookkeeping (orders, performance, signals) for a clean
+   * slate. Configurations are preserved. Use before launch to clear corrupt state.
+   */
+  async flattenAndReset(): Promise<{
+    flattened: boolean;
+    positionsClosed: number;
+    marketOpen: boolean;
+    deleted: { orders: number; performance: number; signals: number };
+    accountAfter: { equity: number | null; cash: number | null } | null;
+  }> {
+    const marketOpen = await this.alpaca.isMarketOpen();
+
+    // 1) Cancel open orders, then close every position at market.
+    await this.alpaca.cancelAllOrders();
+    const closeRes = await this.alpaca.closeAllPositions();
+
+    // 2) Wipe corrupt bookkeeping (keep configurations + symbol list).
+    const delPerf = await this.prisma.performance.deleteMany({});
+    const delOrders = await this.prisma.order.deleteMany({});
+    const delSignals = await this.prisma.signal.deleteMany({});
+
+    const account = await this.alpaca.getAccount();
+
+    this.logger.warn(
+      `FLATTEN+RESET: closed ${closeRes.length} positions, wiped ${delOrders.count} orders / ` +
+      `${delPerf.count} performance / ${delSignals.count} signals (marketOpen=${marketOpen})`,
+    );
+
+    return {
+      flattened: true,
+      positionsClosed: closeRes.length,
+      marketOpen,
+      deleted: { orders: delOrders.count, performance: delPerf.count, signals: delSignals.count },
+      accountAfter: account
+        ? { equity: round2(Number(account.equity ?? 0)), cash: round2(Number(account.cash ?? 0)) }
+        : null,
+    };
+  }
+
+  /**
    * Reconciles the local DB against Alpaca's real fill history.
    * dryRun=true → only returns the truthful report, no DB writes.
    * dryRun=false → wipes the corrupt order/performance tables and rebuilds them
