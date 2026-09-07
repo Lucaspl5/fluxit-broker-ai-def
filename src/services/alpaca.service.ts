@@ -125,10 +125,20 @@ export class AlpacaService {
   }
 
   async getLatestPrice(symbol: string): Promise<number | null> {
+    if (!this.alpaca) return null;
     try {
-      const bars = await this.getHistoricalData(symbol, '1Day', 1);
-      if (bars.length === 0) return null;
-      return bars[bars.length - 1].close;
+      const start = new Date();
+      start.setDate(start.getDate() - 7);
+      const iterator = await this.alpaca.getBarsV2(symbol, {
+        timeframe: '1Day',
+        start: start.toISOString().split('T')[0],
+      });
+      let lastClose: number | null = null;
+      for await (const bar of iterator) {
+        const close = bar.ClosePrice ?? bar.c ?? bar.close;
+        if (close != null) lastClose = Number(close);
+      }
+      return lastClose;
     } catch (error) {
       this.logger.error(`getLatestPrice(${symbol}): ${error.message}`);
       return null;
